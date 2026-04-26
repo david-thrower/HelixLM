@@ -1,0 +1,1 @@
+This project is licensed under a modified Apache 2.0 license, see: [https://github.com/david-thrower/cerebros-core-algorithm-alpha/blob/main/license.md](https://github.com/david-thrower/cerebros-core-algorithm-alpha/blob/main/license.md)
