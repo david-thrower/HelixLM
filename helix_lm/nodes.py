@@ -69,15 +69,20 @@ class LinearAttnNode(HeteroNode):
         k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        q = self._feature_map(self.q_feat(q))
-        k = self._feature_map(self.k_feat(k))
+        # AMP-safe: compute feature maps and cumulatives in fp32 to prevent
+        # float16 overflow. The einsum over feature_dim can exceed 65504.
+        q_fp32 = self._feature_map(self.q_feat(q.float()))
+        k_fp32 = self._feature_map(self.k_feat(k.float()))
+        v_fp32 = v.float()
 
-        k_cum = torch.cumsum(k, dim=2)
-        kv = torch.einsum('bhTf,bhTd->bhTfd', k, v)
+        kv = torch.einsum('bhTf,bhTd->bhTfd', k_fp32, v_fp32)
         kv_cum = torch.cumsum(kv, dim=2)
-        z = torch.cumsum(k, dim=2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        z = torch.cumsum(k_fp32, dim=2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
 
-        out = torch.einsum('bhTf,bhTfd->bhTd', q, kv_cum) / z
+        out = torch.einsum('bhTf,bhTfd->bhTd', q_fp32, kv_cum) / z
+        out = out.to(x.dtype)  # cast back to fp16/bf16
+        # --------------------------------------------------------------
+
         out = out.transpose(1, 2).reshape(B, T, D)
         out = self.dropout(self.out_proj(out))
         return out, None
