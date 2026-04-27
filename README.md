@@ -124,6 +124,39 @@ Cerebros (the original inspiration https://github.com/david-thrower/cerebros-cor
 
 ---
 
+## HelixLM + Titans - Inspired Neural Memory Integration: Titans-style Neural Memory Node**
+
+The implementation adds persistent, surprise-gated neural memory to HelixLM's
+heterogeneous graph architecture, enabling:
+1. **Cross-sequence memory**: Memory persists across forward passes/chunks
+2. **Test-time learning**: Memory updates via delta rule during inference
+3. **Guaranteed inclusion**: `titans_always_select=True` ensures at least one
+   Titans node is always present in the graph
+
+
+## Architecture: TitansMemoryNode
+
+Based on Behrouz et al. (2025) "Titans: Learning to Memorize at Test Time" MAC variant:
+
+```
+Input x (B, T, D)
+  → k_proj → φ(k)  (keys for memory update)
+  → v_proj → v     (values for memory update)
+  → q_proj → φ(q)  (queries for memory retrieval)
+
+Memory M (B, feature_dim, D) — persistent across chunks:
+  For each token t:
+    v_pred = k_t @ M
+    surprise = ||v_t - v_pred||
+    delta = outer_product(k_t, v_t)
+    M = M + η * surprise * delta
+    M = layer_norm(M)
+
+Output = x + proj(φ(q) @ M)
+```
+
+---
+
 ## The "Why HelixLM?" in Practice?
 
 ### For Hyperpersonalization (Use Case 1)

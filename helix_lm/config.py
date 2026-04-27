@@ -1,330 +1,265 @@
 """
-HelixLM Configuration with HuggingFace PretrainedConfig integration.
+HelixLM Configuration.
 
-Scales from tiny smoke-test models (128 d_model) up to multi-billion
-parameter production models via a single dataclass.
+Defines model hyperparameters, presets, and architectural wiring rules.
 """
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Dict, Any
-import torch
-from transformers import PretrainedConfig
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Tuple, List, Dict, Any
 
 
-class HelixConfig(PretrainedConfig):
+@dataclass
+class HelixConfig:
     """
-    Configuration class for HelixLM models.
+    Configuration dataclass for HelixLM.
 
-    Inherits from PretrainedConfig for seamless HuggingFace integration.
-    All dimensions are configurable to allow scaling from proof-of-concept
-    to production (100M - 4B parameters).
-
-    Preset recipes:
-      - tiny:   d_model=128,  n_columns=2, nodes=(2,2),         ~0.5M
-      - small:  d_model=256,  n_columns=3, nodes=(2,3,2),       ~5M
-      - base:   d_model=512,  n_columns=4, nodes=(3,4,4,3),     ~25M
-      - medium: d_model=768,  n_columns=5, nodes=(3,4,4,4,3),   ~100M
-      - large:  d_model=1024, n_columns=6, nodes=(4,5,5,5,5,4),  ~300M
-      - xl:     d_model=1536, n_columns=6, nodes=(5,6,6,6,6,5),  ~1B
-      - xxl:    d_model=2048, n_columns=7, nodes=(5,6,6,6,6,6,5), ~4B
+    All architectural and training hyperparameters are centralized here.
+    Preset classmethods provide sensible defaults for common model sizes.
     """
-    model_type = "helix"
 
-    def __init__(
-        self,
-        # --- Token / Sequence ---
-        vocab_size: int = 50257,
-        seq_len: int = 2048,
-        batch_size: int = 8,
+    # -------------------- Core dimensions --------------------
+    vocab_size: int = 50257          # GPT-2 vocab size default
+    seq_len: int = 256               # Maximum sequence length
+    d_model: int = 128               # Hidden dimension
+    n_columns: int = 2               # Number of graph columns (depth)
+    nodes_per_column: Tuple[int, ...] = (2, 2)  # Nodes in each column
+    n_heads: int = 4                 # Attention heads
+    n_loops: int = 1                 # Depth-wise recurrence loops
+    dropout: float = 0.0             # Dropout rate
 
-        # --- Core dimensions ---
-        d_model: int = 256,
-        n_columns: int = 3,
-        nodes_per_column: Tuple[int, ...] = (2, 3, 2),
+    # -------------------- Attention --------------------
+    attention_mode: str = "linear"   # "linear", "full", "hybrid"
+    hybrid_full_attention_interval: int = 3  # Every Nth column uses full attention in hybrid mode
+    use_rope: bool = True              # Rotary positional embeddings
+    rope_theta: float = 10000.0        # RoPE base frequency
+    use_spectral_init: bool = True     # Spectral normalization for LTI stability
 
-        # --- Attention ---
-        attention_mode: str = "hybrid",  # "linear", "full", "hybrid"
-        hybrid_full_attention_interval: int = 4,
-        n_heads: int = 4,
-        k_proj_dim: int = 32,
-        dropout: float = 0.05,
+    # -------------------- Recurrent block --------------------
+    use_act_halting: bool = False      # Adaptive Computation Time halting
+    act_threshold: float = 0.5         # ACT confidence threshold
+    use_lti_injection: bool = True     # Linear Time-Invariant stability injection
+    lti_spectral_radius: float = 0.95  # Spectral radius cap for LTI matrix A
 
-        # --- Linear Attention ---
-        linear_feature_dim: int = 64,
+    # -------------------- Mamba-2 SSM --------------------
+    use_mamba2: bool = False           # Enable Mamba-2 SSD nodes
+    mamba2_d_state: int = 64           # Mamba-2 state dimension
+    mamba2_d_conv: int = 4             # Mamba-2 conv kernel size
+    mamba2_expand: int = 2             # Mamba-2 expansion factor
+    mamba2_dt_rank: str = "auto"       # Mamba-2 dt projection rank
 
-        # --- SSM (Mamba-2 SSD) ---
-        use_ssm: bool = False,
-        ssm_d_state: int = 64,
-        ssm_d_conv: int = 4,
-        ssm_expand: int = 2,
-        ssm_dt_rank: str = "auto",
-        ssm_conv_bias: bool = True,
-        ssm_bias: bool = False,
+    # -------------------- Titans Neural Memory --------------------
+    use_titans_memory: bool = False    # Enable Titans-style neural memory nodes
+    titans_feature_dim: int = 64       # Memory feature dimension (keys)
+    titans_eta_init: float = 0.01      # Initial learning rate for memory updates
+    titans_n_heads: int = 4            # Number of memory retrieval heads
+    titans_dropout: float = 0.0          # Dropout on memory output
+    titans_always_select: bool = True  # Guarantee at least one Titans node in graph
 
-        # --- Recurrent depth ---
-        n_loops: int = 2,
-        act_threshold: float = 0.99,
-        loop_dim_ratio: float = 0.125,
+    # -------------------- Graph wiring --------------------
+    vertical_p: float = 0.5            # Probability of vertical (feedforward) edge
+    lateral_p: float = 0.3             # Probability of lateral (skip) edge
+    vertical_depth: int = 2            # How many previous columns can connect
+    random_seed: Optional[int] = None  # Graph wiring RNG seed (None = random)
 
-        # --- Graph topology ---
-        lateral_p: float = 0.5,
-        vertical_depth: int = 2,
-        vertical_p: float = 0.7,
-        gate_sinkhorn_iters: int = 5,
+    # -------------------- Training --------------------
+    lr: float = 5e-4                   # Learning rate
+    weight_decay: float = 0.01           # Weight decay
+    grad_clip: float = 1.0               # Gradient clipping norm
+    epochs: int = 10                     # Training epochs (for smoke tests)
+    batch_size: int = 4                  # Batch size
+    grad_accum_steps: int = 1            # Gradient accumulation steps
+    use_amp: bool = False                # Automatic Mixed Precision (disabled by default for stability)
+    warmup_steps: int = 500              # LR warmup steps
+    min_tail_len: int = 1                # Minimum document tail length for chunking
 
-        # --- FFN ---
-        ffn_expansion: float = 2.0,
+    # -------------------- Tokenizer --------------------
+    tokenizer_name: str = "gpt2"       # "gpt2", "qwen", "char", or HF name
+    pad_token_id: int = 0                # Pad token ID
+    eos_token_id: int = 1                # EOS token ID
 
-        # --- Positional encoding ---
-        rope_theta: float = 10000.0,
-        use_rope: bool = True,
+    # -------------------- Initialization --------------------
+    initializer_range: float = 0.02      # Stddev for weight initialization
+    dtype: str = "float32"               # Model dtype string
 
-        # --- Training ---
-        lr: float = 3e-4,
-        weight_decay: float = 0.1,
-        epochs: int = 100,
-        warmup_steps: int = 100,
-        grad_clip: float = 1.0,
-
-        # --- Initialization ---
-        initializer_range: float = 0.02,
-
-        # --- Device ---
-        device: str = "auto",
-        dtype: str = "float32",
-
-        # --- Tokenizer ---
-        tokenizer_name: str = "gpt2",  # "char", "gpt2", "qwen", "custom"
-        pad_token_id: int = 0,
-        eos_token_id: int = 0,
-        bos_token_id: int = 0,
-
-        # --- Generation ---
-        max_new_tokens: int = 20,
-        temperature: float = 0.8,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        repetition_penalty: float = 1.0,
-        do_sample: bool = True,
-
-        # --- Chat / Template ---
-        chat_template: Optional[str] = None,
-        stop_strings: Optional[List[str]] = None,
-
-        # --- VLM ---
-        is_vlm: bool = False,
-        vision_encoder: Optional[str] = None,
-        vision_hidden_size: int = 768,
-        vision_patch_size: int = 16,
-        vision_image_size: int = 448,
-        vision_num_hidden_layers: int = 24,
-        vision_intermediate_size: int = 3072,
-        vision_num_attention_heads: int = 16,
-        fusion_strategy: str = "perceiver",  # "perceiver", "simple_merge"
-
-        # --- Misc ---
-        tie_word_embeddings: bool = True,
-        **kwargs,
-    ):
-        # --- HF PretrainedConfig expects these ---
-        self.vocab_size = vocab_size
-        self.pad_token_id = pad_token_id or 0
-        self.eos_token_id = eos_token_id or 0
-        self.bos_token_id = bos_token_id or 0
-        self.tie_word_embeddings = tie_word_embeddings
-
-        # --- Core dims ---
-        self.seq_len = seq_len
-        self.batch_size = batch_size
-        self.d_model = d_model
-        self.n_columns = n_columns
-        self.nodes_per_column = nodes_per_column
-
-        # --- Attention ---
-        self.attention_mode = attention_mode
-        self.hybrid_full_attention_interval = hybrid_full_attention_interval
-        self.n_heads = n_heads
-        self.k_proj_dim = k_proj_dim
-        self.dropout = dropout
-        self.linear_feature_dim = linear_feature_dim
-
-        # --- SSM ---
-        self.use_ssm = use_ssm
-        self.ssm_d_state = ssm_d_state
-        self.ssm_d_conv = ssm_d_conv
-        self.ssm_expand = ssm_expand
-        self.ssm_dt_rank = ssm_dt_rank
-        self.ssm_conv_bias = ssm_conv_bias
-        self.ssm_bias = ssm_bias
-
-        # --- Recurrent ---
-        self.n_loops = n_loops
-        self.act_threshold = act_threshold
-        self.loop_dim_ratio = loop_dim_ratio
-
-        # --- Graph ---
-        self.lateral_p = lateral_p
-        self.vertical_depth = vertical_depth
-        self.vertical_p = vertical_p
-        self.gate_sinkhorn_iters = gate_sinkhorn_iters
-
-        # --- FFN ---
-        self.ffn_expansion = ffn_expansion
-
-        # --- ROPE ---
-        self.rope_theta = rope_theta
-        self.use_rope = use_rope
-
-        # --- Training ---
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.epochs = epochs
-        self.warmup_steps = warmup_steps
-        self.grad_clip = grad_clip
-        self.initializer_range = initializer_range
-        self.device = device
-        self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
-
-        # --- Tokenizer ---
-        self.tokenizer_name = tokenizer_name
-
-        # --- Generation ---
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.top_k = top_k
-        self.top_p = top_p
-        self.repetition_penalty = repetition_penalty
-        self.do_sample = do_sample
-
-        # --- Chat ---
-        self.chat_template = chat_template
-        self.stop_strings = stop_strings or ["<|endoftext|>", "<|im_end|>", "</s>"]
-
-        # --- VLM ---
-        self.is_vlm = is_vlm
-        self.vision_encoder = vision_encoder
-        self.vision_hidden_size = vision_hidden_size
-        self.vision_patch_size = vision_patch_size
-        self.vision_image_size = vision_image_size
-        self.vision_num_hidden_layers = vision_num_hidden_layers
-        self.vision_intermediate_size = vision_intermediate_size
-        self.vision_num_attention_heads = vision_num_attention_heads
-        self.fusion_strategy = fusion_strategy
-
-        # --- Validation ---
-        assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
-        assert self.attention_mode in ["linear", "full", "hybrid"]
-
-        # Ensure nodes_per_column matches n_columns
-        npc = self.nodes_per_column
-        if len(npc) != self.n_columns:
-            if len(npc) < self.n_columns:
-                npc = npc + (npc[-1],) * (self.n_columns - len(npc))
-            else:
-                npc = npc[:self.n_columns]
-            self.nodes_per_column = npc
-
-        # --- HF compat ---
-        self.use_cache = kwargs.get("use_cache", True)
-
-        super().__init__(
-            pad_token_id=self.pad_token_id,
-            eos_token_id=self.eos_token_id,
-            bos_token_id=self.bos_token_id,
-            tie_word_embeddings=self.tie_word_embeddings,
-            **kwargs,
-        )
-
-    @property
-    def head_dim(self) -> int:
-        return self.d_model // self.n_heads
-
-    @property
-    def loop_dim(self) -> int:
-        return max(1, int(self.d_model * self.loop_dim_ratio))
-
-    @property
-    def ssm_dt_rank_value(self) -> int:
-        if self.ssm_dt_rank == "auto":
-            return max(1, self.d_model // 16)
-        return int(self.ssm_dt_rank)
+    # -------------------- HF compatibility --------------------
+    return_dict: bool = True             # Return dict from forward (HF style)
+    use_cache: bool = True               # Use KV cache during generation
 
     def to_dict(self) -> Dict[str, Any]:
-        d = super().to_dict()
-        d["dtype"] = str(self.dtype)
-        return d
+        """Serialize to dictionary."""
+        return asdict(self)
 
     @classmethod
-    def tiny(cls, **kwargs):
-        """~0.5M parameters — smoke test / debugging."""
+    def from_dict(cls, d: Dict[str, Any]) -> "HelixConfig":
+        """Deserialize from dictionary."""
+        # Filter to known fields
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in known}
+        return cls(**filtered)
+
+    # -------------------- Presets --------------------
+    @classmethod
+    def tiny(cls, **kwargs) -> "HelixConfig":
+        """Tiny config for smoke tests."""
         defaults = dict(
-            d_model=128, n_columns=2, nodes_per_column=(2, 2),
-            n_heads=4, n_loops=1, seq_len=256, use_ssm=False,
+            vocab_size=0,  # set after tokenizer
+            seq_len=64,
+            batch_size=4,
+            d_model=128,
+            n_columns=2,
+            nodes_per_column=(2, 2),
+            attention_mode="linear",
+            n_heads=4,
+            n_loops=1,
+            dropout=0.0,
+            lr=5e-4,
+            weight_decay=0.01,
+            epochs=30,
+            grad_clip=1.0,
+            tokenizer_name="char",
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
-    def small(cls, **kwargs):
-        """~5M parameters — experiments and small-scale training."""
+    def small(cls, **kwargs) -> "HelixConfig":
+        """Small config for experiments."""
         defaults = dict(
-            d_model=256, n_columns=3, nodes_per_column=(2, 3, 2),
-            n_heads=4, n_loops=2, seq_len=512, use_ssm=False,
+            seq_len=512,
+            batch_size=4,
+            d_model=256,
+            n_columns=3,
+            nodes_per_column=(2, 3, 2),
+            attention_mode="hybrid",
+            n_heads=4,
+            n_loops=2,
+            dropout=0.05,
+            lr=3e-4,
+            weight_decay=0.01,
+            epochs=10,
+            grad_clip=1.0,
+            tokenizer_name="gpt2",
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
-    def base(cls, **kwargs):
-        """~25M parameters — serious pretraining."""
+    def base(cls, **kwargs) -> "HelixConfig":
+        """Base config for pretraining."""
         defaults = dict(
-            d_model=512, n_columns=4, nodes_per_column=(3, 4, 4, 3),
-            n_heads=8, n_loops=2, seq_len=1024, use_ssm=True,
+            seq_len=1024,
+            batch_size=8,
+            d_model=512,
+            n_columns=4,
+            nodes_per_column=(3, 4, 4, 3),
+            attention_mode="hybrid",
+            n_heads=8,
+            n_loops=2,
+            dropout=0.1,
+            lr=2e-4,
+            weight_decay=0.01,
+            epochs=5,
+            grad_clip=1.0,
+            tokenizer_name="gpt2",
+            use_mamba2=True,
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
-    def medium(cls, **kwargs):
-        """~100M parameters — production small model."""
+    def medium(cls, **kwargs) -> "HelixConfig":
+        """Medium config for production small."""
         defaults = dict(
-            d_model=768, n_columns=5, nodes_per_column=(3, 4, 4, 4, 3),
-            n_heads=12, n_loops=3, seq_len=2048, use_ssm=True,
-            ssm_d_state=64,
+            seq_len=2048,
+            batch_size=8,
+            d_model=768,
+            n_columns=5,
+            nodes_per_column=(3, 4, 4, 4, 3),
+            attention_mode="hybrid",
+            n_heads=12,
+            n_loops=3,
+            dropout=0.1,
+            lr=1.5e-4,
+            weight_decay=0.01,
+            epochs=3,
+            grad_clip=1.0,
+            tokenizer_name="gpt2",
+            use_mamba2=True,
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
-    def large(cls, **kwargs):
-        """~300M parameters — competitive with popular small LLMs."""
+    def large(cls, **kwargs) -> "HelixConfig":
+        """Large config for competitive models."""
         defaults = dict(
-            d_model=1024, n_columns=6, nodes_per_column=(4, 5, 5, 5, 5, 4),
-            n_heads=16, n_loops=3, seq_len=4096, use_ssm=True,
-            ssm_d_state=128, ssm_expand=2,
+            seq_len=4096,
+            batch_size=4,
+            d_model=1024,
+            n_columns=6,
+            nodes_per_column=(4, 5, 5, 5, 5, 4),
+            attention_mode="hybrid",
+            n_heads=16,
+            n_loops=3,
+            dropout=0.1,
+            lr=1e-4,
+            weight_decay=0.01,
+            epochs=2,
+            grad_clip=1.0,
+            tokenizer_name="gpt2",
+            use_mamba2=True,
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
-    def xl(cls, **kwargs):
-        """~1B parameters — frontier small model."""
+    def xl(cls, **kwargs) -> "HelixConfig":
+        """XL config for frontier small."""
         defaults = dict(
-            d_model=1536, n_columns=6, nodes_per_column=(5, 6, 6, 6, 6, 5),
-            n_heads=24, n_loops=4, seq_len=8192, use_ssm=True,
-            ssm_d_state=128, ssm_expand=2,
-            ffn_expansion=2.5,
+            seq_len=8192,
+            batch_size=2,
+            d_model=1536,
+            n_columns=6,
+            nodes_per_column=(5, 6, 6, 6, 6, 5),
+            attention_mode="hybrid",
+            n_heads=24,
+            n_loops=4,
+            dropout=0.1,
+            lr=8e-5,
+            weight_decay=0.01,
+            epochs=2,
+            grad_clip=1.0,
+            tokenizer_name="gpt2",
+            use_mamba2=True,
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)
 
     @classmethod
-    def xxl(cls, **kwargs):
-        """~4B parameters — approaching frontier territory."""
+    def xxl(cls, **kwargs) -> "HelixConfig":
+        """XXL config for near-frontier."""
         defaults = dict(
-            d_model=2048, n_columns=7, nodes_per_column=(5, 6, 6, 6, 6, 6, 5),
-            n_heads=32, n_loops=4, seq_len=16384, use_ssm=True,
-            ssm_d_state=256, ssm_expand=2,
-            ffn_expansion=3.0,
+            seq_len=16384,
+            batch_size=1,
+            d_model=2048,
+            n_columns=7,
+            nodes_per_column=(5, 6, 6, 6, 6, 6, 5),
+            attention_mode="hybrid",
+            n_heads=32,
+            n_loops=4,
+            dropout=0.1,
+            lr=5e-5,
+            weight_decay=0.01,
+            epochs=1,
+            grad_clip=1.0,
+            tokenizer_name="gpt2",
+            use_mamba2=True,
+            use_titans_memory=False,
         )
         defaults.update(kwargs)
         return cls(**defaults)

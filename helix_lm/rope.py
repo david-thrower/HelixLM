@@ -1,55 +1,43 @@
 """
-Rotary Positional Embedding (RoPE) for HelixLM.
-Supports standard RoPE, extended sequences, and configurable theta.
+Rotary Positional Embeddings (RoPE) for HelixLM.
 """
-import math
 import torch
-import torch.nn as nn
+import math
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Precompute RoPE frequency tensor [cos, sin] pairs."""
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
-    t = torch.arange(end, dtype=torch.float32)
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    Precompute rotary frequency cis matrix.
+
+    Args:
+        dim: Head dimension (must be even).
+        end: Maximum sequence length.
+        theta: RoPE base frequency.
+
+    Returns:
+        Complex tensor of shape (end, dim//2).
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(end, dtype=freqs.dtype)
     freqs = torch.outer(t, freqs)
-    cos = torch.cos(freqs).to(dtype)
-    sin = torch.sin(freqs).to(dtype)
-    return torch.stack([cos, sin], dim=-1)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """Apply rotary embedding to tensor x of shape (..., seq_len, n_heads, head_dim)."""
-    *leading_dims, seq_len, n_heads, head_dim = x.shape
-    x_reshaped = x.reshape(*leading_dims, seq_len, n_heads, head_dim // 2, 2)
-    cos = freqs_cis[:seq_len, :, 0]
-    sin = freqs_cis[:seq_len, :, 1]
-    for _ in range(len(leading_dims) + 1):
-        cos = cos.unsqueeze(0)
-        sin = sin.unsqueeze(0)
-    x0 = x_reshaped[..., 0]
-    x1 = x_reshaped[..., 1]
-    y0 = x0 * cos - x1 * sin
-    y1 = x0 * sin + x1 * cos
-    y = torch.stack([y0, y1], dim=-1)
-    return y.reshape(*leading_dims, seq_len, n_heads, head_dim)
+def apply_rotary_emb(xq: torch.Tensor, freqs_cis: torch.Tensor):
+    """
+    Apply rotary embeddings to query/key tensors.
 
+    Args:
+        xq: (B, H, T, D) tensor.
+        freqs_cis: (T, D//2) complex tensor.
 
-class RoPE(nn.Module):
-    """Rotary Positional Embedding module with precomputed frequencies."""
-    def __init__(self, dim: int, max_seq_len: int = 8192, theta: float = 10000.0):
-        super().__init__()
-        self.dim = dim
-        self.max_seq_len = max_seq_len
-        self.theta = theta
-        freqs_cis = precompute_freqs_cis(dim, max_seq_len, theta)
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
-
-    def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        return apply_rotary_emb(x, self.freqs_cis)
-
-    def refresh(self, max_seq_len: int, theta: float = None):
-        self.max_seq_len = max_seq_len
-        if theta is not None:
-            self.theta = theta
-        freqs_cis = precompute_freqs_cis(self.dim, max_seq_len, self.theta)
-        self.freqs_cis = freqs_cis.to(self.freqs_cis.device)
+    Returns:
+        Rotated tensor of same shape as xq.
+    """
+    B, H, T, D = xq.shape
+    xq_ = xq.float().reshape(B, H, T, D // 2, 2)
+    xq_complex = torch.view_as_complex(xq_)
+    freqs_cis = freqs_cis[:T].unsqueeze(0).unsqueeze(0)
+    xq_out = torch.view_as_real(xq_complex * freqs_cis).flatten(3)
+    return xq_out.type_as(xq)

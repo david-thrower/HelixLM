@@ -1,94 +1,86 @@
 """
-HelixLM Recurrent block with LTI stable injection and Adaptive Computation Time halting.
+HelixLM Recurrent Block.
+
+Wraps the heterogeneous graph with depth-wise recurrence (n_loops),
+LTI stability injection, and optional ACT halting.
 """
-import math
+from typing import Optional, Tuple, Dict, Any
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .config import HelixConfig
 from .graph import HelixGraph
-from .nodes import RMSNorm
-
-
-class LTIInjection(nn.Module):
-    """Linear Time-Invariant state update for stable recurrent loops."""
-    def __init__(self, dim: int):
-        super().__init__()
-        self.log_A = nn.Parameter(torch.zeros(dim))
-        self.log_dt = nn.Parameter(torch.zeros(1))
-        self.B = nn.Parameter(torch.ones(dim) * 0.1)
-
-    def get_A(self):
-        return torch.exp(-torch.exp((self.log_dt + self.log_A).clamp(-20, 20)))
-
-    def forward(self, h, e, trans_out):
-        A = self.get_A().view(1, 1, -1)
-        return A * h + self.B.view(1, 1, -1) * e + trans_out
-
-
-class ACTHalting(nn.Module):
-    """Adaptive Computation Time halting mechanism."""
-    def __init__(self, dim: int, threshold: float = 0.99):
-        super().__init__()
-        self.halt = nn.Linear(dim, 1)
-        self.threshold = threshold
-        nn.init.xavier_uniform_(self.halt.weight)
-
-    def forward(self, h: torch.Tensor):
-        return torch.sigmoid(self.halt(h)).squeeze(-1)
-
-
-def loop_index_embedding(h: torch.Tensor, loop_t: int, loop_dim: int, theta: float = 10000.0):
-    """Add sinusoidal loop-index embedding to hidden state."""
-    device = h.device
-    dtype = h.dtype
-    freqs = 1.0 / (theta ** (torch.arange(0, loop_dim, 2, device=device, dtype=torch.float32) / loop_dim))
-    angles = loop_t * freqs
-    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-    if emb.size(0) < loop_dim:
-        emb = F.pad(emb, (0, loop_dim - emb.size(0)))
-    buf = torch.zeros(h.size(-1), device=device, dtype=dtype)
-    buf[:loop_dim] = emb[:loop_dim]
-    return h + buf.view(1, 1, -1)
 
 
 class HelixRecurrentBlock(nn.Module):
-    """Recurrent block that loops over the HelixGraph with LTI stability and ACT halting."""
+    """
+    A single recurrent block that loops over the HelixGraph.
+
+    Args:
+        cfg: HelixConfig instance.
+    """
     def __init__(self, cfg: HelixConfig):
         super().__init__()
         self.cfg = cfg
         self.graph = HelixGraph(cfg)
-        self.norm = RMSNorm(cfg.d_model)
-        self.injection = LTIInjection(cfg.d_model)
-        self.act = ACTHalting(cfg.d_model, cfg.act_threshold)
-        self.loop_dim = cfg.loop_dim
 
-    def forward(self, h: torch.Tensor, e: torch.Tensor, freqs_cis=None):
-        B, T, D = h.shape
-        device = h.device
+        # LTI stability injection matrices
+        if cfg.use_lti_injection:
+            self.lti_A = nn.Parameter(torch.randn(cfg.d_model, cfg.d_model) * 0.02)
+            self.lti_B = nn.Parameter(torch.randn(cfg.d_model, cfg.d_model) * 0.02)
+            # Spectral normalization to ensure stability
+            if cfg.use_spectral_init:
+                with torch.no_grad():
+                    u, s, v = torch.svd(self.lti_A)
+                    s = s.clamp(max=cfg.lti_spectral_radius)
+                    self.lti_A.copy_(u @ torch.diag(s) @ v.T)
 
-        h_out = torch.zeros_like(h)
-        cum_p = torch.zeros(B, T, device=device)
-        halted = torch.zeros(B, T, device=device, dtype=torch.bool)
-        node_states = {}
+        # ACT halting probability
+        if cfg.use_act_halting:
+            self.act_proj = nn.Linear(cfg.d_model, 1)
 
-        for t in range(self.cfg.n_loops):
-            h_loop = loop_index_embedding(h, t, self.loop_dim)
-            combined = self.norm(h_loop + e)
-            trans_out, node_states = self.graph(combined, states=node_states)
-            h = self.injection(h, e, trans_out)
-            p = self.act(h)
+    def forward(
+        self,
+        x: torch.Tensor,
+        persistent_states: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+        """
+        Args:
+            x: (B, T, D) input.
+            persistent_states: Node states from previous chunk (for SSM / Titans).
 
-            still = ~halted
-            rem = (1.0 - cum_p).clamp(min=0)
-            weight = torch.where(cum_p + p >= self.cfg.act_threshold, rem, p)
-            weight = weight * still.float()
-            h_out = h_out + weight.unsqueeze(-1) * h
-            cum_p = cum_p + p * still.float()
-            halted = halted | (cum_p >= self.cfg.act_threshold)
+        Returns:
+            (output, updated_persistent_states)
+        """
+        cfg = self.cfg
+        h = x
+        act_loss = 0.0
 
-            if halted.all() and not self.training:
-                break
+        # Initialize persistent states if None
+        if persistent_states is None:
+            persistent_states = {}
 
-        return h_out
+        updated_states = {}
+
+        for loop in range(cfg.n_loops):
+            # Run graph with persistent states
+            h_new, loop_states = self.graph(h, states=persistent_states)
+
+            # LTI stability injection
+            if cfg.use_lti_injection and loop > 0:
+                h = torch.matmul(h, self.lti_A) + torch.matmul(h_new, self.lti_B)
+            else:
+                h = h_new
+
+            # Merge loop states into updated_states (accumulate across loops)
+            for k, v in loop_states.items():
+                updated_states[k] = v
+
+            # ACT halting (simplified: just check mean activation)
+            if cfg.use_act_halting:
+                halt_prob = torch.sigmoid(self.act_proj(h.mean(dim=1, keepdim=True)))
+                if halt_prob.mean().item() > cfg.act_threshold:
+                    break
+
+        return h, updated_states

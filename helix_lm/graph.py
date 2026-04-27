@@ -1,229 +1,310 @@
 """
-HelixGraph: Biological brain-inspired heterogeneous graph executor.
-"""
-import math
-import random
-from typing import Dict, List, Optional, Tuple, Any
+HelixLM Graph Builder & Executor.
 
-import numpy as np
+Implements the heterogeneous directed acyclic graph (DAG) that forms the
+computational backbone of HelixLM.  Nodes are wired with vertical
+(feed-forward) and lateral (skip) edges, then executed in topological order.
+"""
+import random
+from typing import Dict, List, Tuple, Any, Optional
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from .config import HelixConfig
 from .nodes import (
-    HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode
+    HeteroNode,
+    LinearAttnNode,
+    FullAttnNode,
+    SwiGLUNode,
+    GateNode,
+    Mamba2Node,
+    TitansMemoryNode,
 )
 
 
 class HelixGraph(nn.Module):
     """
-    Randomly wired heterogeneous graph of neural nodes.
-    
-    - Topology: Biological-style neural columns with vertical and lateral connections
-    - Aggregation: learned per-node merge (Linear bottleneck) or Gate
-    - Stateful nodes (SSM/Mamba-2) expose state read/write across loops
+    Heterogeneous DAG of neural columns.
+
+    Each ``column`` is a set of nodes that execute in parallel (within the
+    column).  Edges connect earlier columns to later ones (vertical) or
+    nodes within the same column (lateral).  The graph is rebuilt from a
+    random seed on every ``__init__`` call, but the wiring is frozen after
+    construction.
+
+    Args:
+        cfg: HelixConfig instance.
     """
-    def __init__(self, cfg: HelixConfig, seed: int = 42):
+    def __init__(self, cfg: HelixConfig):
         super().__init__()
         self.cfg = cfg
-        rng = np.random.RandomState(seed)
-        torch.manual_seed(seed)
+        self.rng = random.Random(cfg.random_seed)
 
-        self.node_spec = self._build_node_spec()
-        self.nodes = nn.ModuleDict()
-        self.node_meta: Dict[str, Tuple[int, int, str]] = {}
+        # Build node specifications
+        self.node_spec: List[Tuple[str, Dict[str, Any]]] = []
+        self._build_node_spec()
 
-        nid = 0
-        for ci, column in enumerate(self.node_spec):
-            for ni, (ntype, ncfg) in enumerate(column):
-                name = f"n{nid}"
-                self.node_meta[name] = (ci, ni, ntype)
-                self.nodes[name] = self._create_node(ntype, ncfg)
-                nid += 1
+        # Instantiate nodes
+        self.nodes: Dict[str, nn.Module] = nn.ModuleDict()
+        self.node_meta: Dict[str, Tuple[int, str]] = {}  # name -> (column_index, node_type)
+        for name, (ntype, kwargs) in self.node_spec:
+            node = self._create_node(ntype, kwargs)
+            self.nodes[name] = node
+            # Infer column index from name (col{i}_...)
+            col_idx = int(name.split("_")[0][3:])
+            self.node_meta[name] = (col_idx, ntype)
 
-        # Build random wiring
-        self.graph: Dict[str, List[str]] = {}
-        names = list(self.nodes.keys())
+        # Build wiring (predecessor lists)
+        self.preds: Dict[str, List[str]] = {}
+        self._build_wiring()
 
-        for name in names:
-            ci, idx, ntype = self.node_meta[name]
-            preds: List[str] = []
+        # Topological order for execution
+        self.order = self._topological_sort()
 
-            # Vertical connections
-            if ci > 0:
-                for pc in range(max(0, ci - cfg.vertical_depth), ci):
-                    above = [k for k, v in self.node_meta.items() if v[0] == pc]
-                    if above and rng.rand() < cfg.vertical_p:
-                        n_pick = rng.randint(1, len(above) + 1)
-                        chosen = rng.choice(above, size=min(n_pick, len(above)), replace=False)
-                        preds.extend(chosen.tolist())
-
-            # Lateral connections
-            same_column = [k for k, v in self.node_meta.items() if v[0] == ci and v[1] < idx]
-            for s in same_column:
-                if rng.rand() < cfg.lateral_p:
-                    preds.append(s)
-
-            # Dead-end failsafe
-            if not preds and ci > 0:
-                above = [k for k, v in self.node_meta.items() if v[0] == ci - 1]
-                if above:
-                    preds.append(rng.choice(above))
-
-            self.graph[name] = preds
-
-        # Merge layers for multi-predecessor non-gate nodes
-        self.merges = nn.ModuleDict()
-        for name, preds in self.graph.items():
-            if len(preds) > 1 and self.node_meta[name][2] != "gate":
-                self.merges[name] = nn.Linear(len(preds) * cfg.d_model, cfg.d_model)
-
-        self.order = self._topsort()
-        self.root_nodes = [n for n in names if len(self.graph[n]) == 0 or self.node_meta[n][0] == 0]
-        last_col = max(v[0] for v in self.node_meta.values())
-        self.sink_nodes = [k for k, v in self.node_meta.items() if v[0] == last_col]
-
-    def _build_node_spec(self) -> List[List[Tuple[str, dict]]]:
+    # ------------------------------------------------------------------
+    # Node specification builder
+    # ------------------------------------------------------------------
+    def _build_node_spec(self):
+        """Generate the list of (node_type, kwargs) per column."""
         cfg = self.cfg
-        spec = []
+        has_titans = False
+
         for ci in range(cfg.n_columns):
-            column = []
-            use_full_attn = False
-            if cfg.attention_mode == "full":
+            n_nodes = cfg.nodes_per_column[ci] if ci < len(cfg.nodes_per_column) else cfg.nodes_per_column[-1]
+            column: List[Tuple[str, Dict[str, Any]]] = []
+
+            # Attention node
+            use_full_attn = cfg.attention_mode == "full"
+            if cfg.attention_mode == "hybrid" and (ci % cfg.hybrid_full_attention_interval == 0):
                 use_full_attn = True
-            elif cfg.attention_mode == "hybrid":
-                use_full_attn = (ci % cfg.hybrid_full_attention_interval == 0)
 
             if use_full_attn:
                 column.append(("full_attn", {
-                    "d_model": cfg.d_model, "n_heads": cfg.n_heads,
-                    "dropout": cfg.dropout, "use_rope": cfg.use_rope,
+                    "d_model": cfg.d_model,
+                    "n_heads": cfg.n_heads,
+                    "use_rope": cfg.use_rope,
+                    "dropout": cfg.dropout,
                 }))
             else:
                 column.append(("linear_attn", {
-                    "d_model": cfg.d_model, "n_heads": cfg.n_heads,
-                    "feature_dim": cfg.linear_feature_dim, "dropout": cfg.dropout,
+                    "d_model": cfg.d_model,
+                    "n_heads": cfg.n_heads,
+                    "use_rope": cfg.use_rope,
+                    "dropout": cfg.dropout,
                 }))
 
+            # Feedforward node
             column.append(("swiglu", {
-                "d_model": cfg.d_model, "expansion": cfg.ffn_expansion, "dropout": cfg.dropout,
+                "d_model": cfg.d_model,
+                "dropout": cfg.dropout,
             }))
 
-            if cfg.use_ssm:
-                if hasattr(cfg, 'ssm_d_state') and cfg.ssm_d_state >= 64:
-                    # Use Mamba-2 for larger state dimensions
-                    column.append(("mamba2", {
-                        "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
-                        "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand,
-                        "dt_rank": cfg.ssm_dt_rank if hasattr(cfg, 'ssm_dt_rank') else "auto",
-                        "conv_bias": cfg.ssm_conv_bias if hasattr(cfg, 'ssm_conv_bias') else True,
-                        "bias": cfg.ssm_bias if hasattr(cfg, 'ssm_bias') else False,
-                        "dropout": cfg.dropout,
-                    }))
-                else:
-                    column.append(("ssm", {
-                        "d_model": cfg.d_model, "d_state": cfg.ssm_d_state,
-                        "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand, "dropout": cfg.dropout,
-                    }))
-
-            if len(column) > 1 or ci > 0:
-                column.append(("gate", {
-                    "d_model": cfg.d_model, "n_preds": len(column), "dropout": cfg.dropout,
+            # Optional Mamba-2 SSM
+            if cfg.use_mamba2:
+                column.append(("mamba2", {
+                    "d_model": cfg.d_model,
+                    "d_state": cfg.mamba2_d_state,
+                    "d_conv": cfg.mamba2_d_conv,
+                    "expand": cfg.mamba2_expand,
+                    "dt_rank": cfg.mamba2_dt_rank,
+                    "dropout": cfg.dropout,
                 }))
 
-            spec.append(column)
-        return spec
+            # Optional Titans Neural Memory — guaranteed at least once
+            if cfg.use_titans_memory:
+                if cfg.titans_always_select and ci == 0:
+                    # Force one Titans node into column 0 so it is *always* selected
+                    column.append(("titans", {
+                        "d_model": cfg.d_model,
+                        "feature_dim": cfg.titans_feature_dim,
+                        "eta_init": cfg.titans_eta_init,
+                        "n_heads": cfg.titans_n_heads,
+                        "dropout": cfg.titans_dropout,
+                    }))
+                    has_titans = True
+                elif self.rng.random() < 0.3:
+                    # 30% chance for additional Titans nodes in later columns
+                    column.append(("titans", {
+                        "d_model": cfg.d_model,
+                        "feature_dim": cfg.titans_feature_dim,
+                        "eta_init": cfg.titans_eta_init,
+                        "n_heads": cfg.titans_n_heads,
+                        "dropout": cfg.titans_dropout,
+                    }))
 
-    def _create_node(self, ntype: str, ncfg: dict) -> HeteroNode:
+            # Gate / merge node if column has >1 compute node
+            compute_nodes = [n for n, _ in column if n not in ("gate",)]
+            if len(compute_nodes) > 1:
+                column.append(("gate", {
+                    "d_model": cfg.d_model,
+                    "n_inputs": len(compute_nodes),
+                    "dropout": cfg.dropout,
+                }))
+
+            # Register with unique names
+            for ni, (ntype, kwargs) in enumerate(column):
+                name = f"col{ci}_node{ni}_{ntype}"
+                self.node_spec.append((name, (ntype, kwargs)))
+
+        # Fallback: if titans is enabled but random wiring somehow excluded it,
+        # inject one into the very last column as a dead-end failsafe.
+        if cfg.use_titans_memory and cfg.titans_always_select and not has_titans:
+            ci = cfg.n_columns - 1
+            name = f"col{ci}_node99_titans"
+            self.node_spec.append((name, ("titans", {
+                "d_model": cfg.d_model,
+                "feature_dim": cfg.titans_feature_dim,
+                "eta_init": cfg.titans_eta_init,
+                "n_heads": cfg.titans_n_heads,
+                "dropout": cfg.titans_dropout,
+            })))
+
+    # ------------------------------------------------------------------
+    # Node factory
+    # ------------------------------------------------------------------
+    def _create_node(self, ntype: str, kwargs: Dict[str, Any]) -> HeteroNode:
         if ntype == "linear_attn":
-            return LinearAttnNode(**ncfg)
+            return LinearAttnNode(**kwargs)
         elif ntype == "full_attn":
-            return FullAttnNode(**ncfg)
-        elif ntype == "dense":
-            return DenseNode(**ncfg)
+            return FullAttnNode(**kwargs)
         elif ntype == "swiglu":
-            return SwiGLUNode(**ncfg)
-        elif ntype == "ssm":
-            return SSMNode(**ncfg)
-        elif ntype == "mamba2":
-            return Mamba2Node(**ncfg)
+            return SwiGLUNode(**kwargs)
         elif ntype == "gate":
-            return GateNode(**ncfg)
-        raise ValueError(f"Unknown node type: {ntype}")
+            return GateNode(**kwargs)
+        elif ntype == "mamba2":
+            return Mamba2Node(**kwargs)
+        elif ntype == "titans":
+            return TitansMemoryNode(**kwargs)
+        else:
+            raise ValueError(f"Unknown node type: {ntype}")
 
-    def _topsort(self) -> List[str]:
-        in_deg = {n: 0 for n in self.nodes}
-        adj = {n: [] for n in self.nodes}
-        for n, preds in self.graph.items():
-            for p in preds:
-                adj[p].append(n)
-                in_deg[n] += 1
-        queue = [n for n, d in in_deg.items() if d == 0]
-        out = []
+    # ------------------------------------------------------------------
+    # Wiring
+    # ------------------------------------------------------------------
+    def _build_wiring(self):
+        """Build predecessor lists for each node."""
+        cfg = self.cfg
+        self.preds = {name: [] for name in self.nodes.keys()}
+
+        for name, (col_idx, ntype) in self.node_meta.items():
+            if col_idx == 0:
+                # Root nodes have no predecessors
+                continue
+
+            # Vertical edges: connect to previous columns
+            for pc in range(max(0, col_idx - cfg.vertical_depth), col_idx):
+                above = [k for k, v in self.node_meta.items() if v[0] == pc]
+                if above and self.rng.random() < cfg.vertical_p:
+                    chosen = self.rng.sample(above, k=min(len(above), self.rng.randint(1, 2)))
+                    self.preds[name].extend(chosen)
+
+            # Lateral edges: connect to same column (skip connections)
+            # Only wire from earlier nodes -> later nodes to avoid cycles.
+            same_col = [k for k, v in self.node_meta.items() if v[0] == col_idx and k != name]
+            # Filter to only nodes that come AFTER this node in the column order
+            this_idx = int(name.split("_")[1][4:])  # node{N}_...
+            later_nodes = [k for k in same_col if int(k.split("_")[1][4:]) > this_idx]
+            if later_nodes and self.rng.random() < cfg.lateral_p:
+                chosen = self.rng.sample(later_nodes, k=1)
+                self.preds[name].extend(chosen)
+
+            # Deduplicate
+            self.preds[name] = list(dict.fromkeys(self.preds[name]))
+
+        # Dead-end failsafe: if a node has no preds (and is not column 0), wire to previous column
+        for name, (col_idx, ntype) in self.node_meta.items():
+            if col_idx > 0 and not self.preds[name]:
+                prev_col = col_idx - 1
+                prev_nodes = [k for k, v in self.node_meta.items() if v[0] == prev_col]
+                if prev_nodes:
+                    self.preds[name].append(self.rng.choice(prev_nodes))
+
+    # ------------------------------------------------------------------
+    # Topological sort
+    # ------------------------------------------------------------------
+    def _topological_sort(self) -> List[str]:
+        """Kahn's algorithm."""
+        in_degree = {name: len(self.preds[name]) for name in self.nodes.keys()}
+        queue = [n for n, d in in_degree.items() if d == 0]
+        order = []
+
         while queue:
-            cur = queue.pop(0)
-            out.append(cur)
-            for nxt in adj[cur]:
-                in_deg[nxt] -= 1
-                if in_deg[nxt] == 0:
-                    queue.append(nxt)
-        if len(out) != len(self.nodes):
-            remaining = [n for n in self.nodes if n not in out]
-            raise ValueError(f"Cycle detected! Remaining: {remaining}")
-        return out
+            node = queue.pop(0)
+            order.append(node)
+            for succ, preds in self.preds.items():
+                if node in preds:
+                    in_degree[succ] -= 1
+                    if in_degree[succ] == 0:
+                        queue.append(succ)
 
-    def forward(self, x: torch.Tensor, states: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        if len(order) != len(self.nodes):
+            raise RuntimeError("Cycle detected in HelixGraph wiring!")
+        return order
+
+    # ------------------------------------------------------------------
+    # Forward execution
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        x: torch.Tensor,
+        states: Optional[Dict[str, Any]] = None,
+        freqs_cis: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """
+        Execute the graph in topological order.
+
+        Args:
+            x: Input tensor (B, T, D).
+            states: Optional dict of persistent node states (e.g. SSM state,
+                Titans memory tensors) from a previous chunk.
+            freqs_cis: Precomputed RoPE frequencies.
+
+        Returns:
+            (output, new_states) where new_states maps node names to their
+            updated state tensors (for nodes that maintain state).
+        """
         if states is None:
             states = {}
-        new_states = {}
-        cache: Dict[str, torch.Tensor] = {}
 
-        for name in self.nodes:
-            if not self.graph[name]:
-                cache[name] = x
+        cache = {"freqs_cis": freqs_cis} if freqs_cis is not None else None
+        activations: Dict[str, torch.Tensor] = {}
+        new_states: Dict[str, Any] = {}
 
         for name in self.order:
-            if name in cache:
-                continue
-            preds = self.graph[name]
-            feats = [cache[p] for p in preds]
-            _, _, ntype = self.node_meta[name]
-
-            if len(feats) == 1:
-                merged = feats[0]
-            elif ntype == "gate":
-                merged = feats
-            else:
-                merged = self.merges[name](torch.cat(feats, dim=-1))
-
             node = self.nodes[name]
-            if isinstance(node, (SSMNode, Mamba2Node)):
-                out, s = node(merged, state=states.get(name))
-                new_states[name] = s
-            elif isinstance(node, GateNode):
-                out, _ = node(merged)
+            col_idx, ntype = self.node_meta[name]
+
+            # Gather inputs
+            pred_names = self.preds[name]
+            if not pred_names:
+                # Root node: feed x directly
+                node_input = x
             else:
-                out, _ = node(merged)
-            cache[name] = out
+                # Merge predecessor activations by averaging
+                preds_acts = [activations[p] for p in pred_names if p in activations]
+                if not preds_acts:
+                    node_input = x
+                else:
+                    node_input = torch.stack(preds_acts, dim=0).mean(dim=0)
 
-        if len(self.sink_nodes) == 1:
-            out = cache[self.sink_nodes[0]]
+            # Retrieve persistent state for this node if available
+            node_state = states.get(name, None)
+
+            # Forward
+            out, new_state = node(node_input, state=node_state, cache=cache)
+
+            # Store activation and updated state
+            activations[name] = out
+            if new_state is not None:
+                new_states[name] = new_state
+
+        # Sink: average last-column activations
+        last_col = self.cfg.n_columns - 1
+        sink_nodes = [n for n, (ci, _) in self.node_meta.items() if ci == last_col]
+        if sink_nodes:
+            output = torch.stack([activations[n] for n in sink_nodes], dim=0).mean(dim=0)
         else:
-            out = torch.stack([cache[s] for s in self.sink_nodes], dim=-1).mean(dim=-1)
+            output = x
 
-        return out + x, new_states
-
-    def get_graph_info(self) -> Dict[str, Any]:
-        info = {
-            "n_nodes": len(self.nodes),
-            "n_columns": self.cfg.n_columns,
-            "node_types": {},
-            "n_edges": sum(len(p) for p in self.graph.values()),
-            "roots": self.root_nodes,
-            "sinks": self.sink_nodes,
-        }
-        for name, (ci, idx, ntype) in self.node_meta.items():
-            info["node_types"][ntype] = info["node_types"].get(ntype, 0) + 1
-        return info
+        return output, new_states
