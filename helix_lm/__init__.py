@@ -11,7 +11,10 @@ from .tokenizer import HelixTokenizer
 from .model import HelixLMCore
 from .hf_model import HelixForCausalLM
 from .trainer import Trainer
-from .dataset import HelixDataset, HelixDatasetFromTokens, HelixHFDataset, create_helix_dataloader
+from .dataset import (
+    HelixDataset, HelixDatasetFromTokens, HelixHFDataset,
+    DocumentAwareDataset, create_helix_dataloader, create_document_loader,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -23,5 +26,7 @@ __all__ = [
     "HelixDataset",
     "HelixDatasetFromTokens",
     "HelixHFDataset",
+    "DocumentAwareDataset",
     "create_helix_dataloader",
+    "create_document_loader",
 ]

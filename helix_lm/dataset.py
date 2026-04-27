@@ -7,12 +7,13 @@ Key features:
   - Distinguishes natural stop (end of document) from EOS token
   - Supports both raw text and pre-tokenized inputs
   - Compatible with HF datasets streaming interface
+  - Document-aware chunking: no cross-document boundaries, 100% token utilization
 """
 import random
 from typing import List, Optional, Iterator, Dict, Any, Union, Tuple
 
 import torch
-from torch.utils.data import IterableDataset, Dataset
+from torch.utils.data import IterableDataset, Dataset, DataLoader
 
 
 class HelixDataset(IterableDataset):
@@ -152,6 +153,94 @@ class HelixDataset(IterableDataset):
         }
 
 
+class DocumentAwareDataset(Dataset):
+    """
+    Per-document chunking with no cross-document boundaries.
+
+    For each document:
+      - Long documents: split into non-overlapping seq_len chunks.
+      - Short documents: kept as-is, padded to seq_len.
+      - Final chunk of each document is marked is_natural_stop=True.
+      - Only padding positions are masked in labels (-100).
+      - No label masking for overlap regions (100% token utilization).
+
+    This eliminates the "islands of good PPL in a sea of bad PPL" problem
+    caused by document-boundary crossings in contiguous-stream chunking.
+
+    Args:
+        texts: List of document texts.
+        tokenizer: Tokenizer with encode(), pad_token_id, eos_token_id.
+        seq_len: Target sequence length for all chunks.
+        min_tail_len: Minimum length for a tail chunk to be kept.
+                      Tails shorter than this are dropped.
+                      Default: seq_len // 4 (drop very short tails).
+                      Set to 1 to keep all tails (e.g., for instruct data).
+        add_eos: Whether to append EOS token to each document.
+    """
+    def __init__(self, texts, tokenizer, seq_len, min_tail_len=None, add_eos=True):
+        self.seq_len = seq_len
+        self.pad_id = getattr(tokenizer, "pad_token_id", 0)
+        self.eos_id = getattr(tokenizer, "eos_token_id", self.pad_id)
+        self.chunks = []
+
+        if min_tail_len is None:
+            min_tail_len = seq_len // 4
+
+        dropped_short = 0
+        dropped_tail = 0
+        kept = 0
+
+        for text in texts:
+            text = text.strip()
+            if not text:
+                continue
+
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if len(ids) < min_tail_len:
+                dropped_short += 1
+                continue
+
+            if add_eos and self.eos_id is not None and self.eos_id != self.pad_id:
+                ids.append(self.eos_id)
+
+            n_full = len(ids) // seq_len
+            remainder_len = len(ids) % seq_len
+
+            for i in range(n_full):
+                start = i * seq_len
+                chunk = ids[start:start + seq_len]
+                is_last_chunk = (i == n_full - 1)
+                no_tail_kept = (remainder_len < min_tail_len)
+                self.chunks.append((chunk, is_last_chunk and no_tail_kept))
+                kept += 1
+
+            if remainder_len >= min_tail_len:
+                tail = ids[n_full * seq_len:]
+                tail = tail + [self.pad_id] * (seq_len - remainder_len)
+                self.chunks.append((tail, True))
+                kept += 1
+            elif remainder_len > 0:
+                dropped_tail += 1
+
+        print(f"DocumentAwareDataset: {kept} chunks "
+              f"({dropped_short} short docs dropped, {dropped_tail} tails dropped)")
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def __getitem__(self, idx):
+        chunk, is_natural = self.chunks[idx]
+        x = torch.tensor(chunk, dtype=torch.long)
+        labels = x.clone()
+        labels[x == self.pad_id] = -100
+        return {
+            "input_ids": x,
+            "labels": labels,
+            "attention_mask": (x != self.pad_id).long(),
+            "is_natural_stop": torch.tensor(is_natural, dtype=torch.bool),
+        }
+
+
 class HelixDatasetFromTokens(Dataset):
     """
     Dataset from pre-tokenized token stream (e.g., from HF datasets).
@@ -282,6 +371,63 @@ def create_helix_dataloader(
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        drop_last=drop_last,
+    )
+
+
+def create_document_loader(
+    texts: List[str],
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    shuffle: bool = True,
+    drop_last: bool = True,
+    num_workers: int = 0,
+    min_tail_len: Optional[int] = None,
+    add_eos: bool = True,
+) -> DataLoader:
+    """
+    Create a DataLoader using DocumentAwareDataset (no boundary crossings).
+
+    Args:
+        texts: List of document texts.
+        tokenizer: Tokenizer instance.
+        seq_len: Sequence length for chunks.
+        batch_size: Batch size.
+        shuffle: Whether to shuffle chunks.
+        drop_last: Whether to drop last incomplete batch.
+        num_workers: DataLoader workers.
+        min_tail_len: Minimum tail length to keep. Default seq_len//4.
+                      Use seq_len//4 for pretrain, 1 for instruct.
+        add_eos: Whether to append EOS to documents.
+
+    Returns:
+        DataLoader yielding batches with input_ids, labels, attention_mask,
+        and is_natural_stop tensors.
+    """
+    ds = DocumentAwareDataset(
+        texts, tokenizer, seq_len,
+        min_tail_len=min_tail_len, add_eos=add_eos,
+    )
+
+    def collate_fn(batch):
+        input_ids = torch.stack([b["input_ids"] for b in batch])
+        labels = torch.stack([b["labels"] for b in batch])
+        attention_mask = torch.stack([b["attention_mask"] for b in batch])
+        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "is_natural_stop": is_natural_stop,
+        }
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
         collate_fn=collate_fn,
         num_workers=num_workers,
         drop_last=drop_last,
