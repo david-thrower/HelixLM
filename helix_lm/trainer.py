@@ -401,4 +401,3 @@ class Trainer:
         self.save_checkpoint(epochs, "final_model")
         print(f"\nTraining complete!")
         return self.history
-
