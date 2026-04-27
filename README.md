@@ -346,15 +346,15 @@ HelixLM scales from **0.5M to 4B+ parameters** through a single configuration cl
 
 ## Scaling Guide / Preset recipes
 
-| Preset | d_model | Columns | Nodes | Heads | Loops | SSM | ~Params | Seq Len | Use Case |
-|--------|---------|---------|-------|-------|-------|-----|---------|---------|----------|
-| `tiny` | 128 | 2 | (2,2) | 4 | 1 | No | 0.5M | 256 | Smoke test |
-| `small` | 256 | 3 | (2,3,2) | 4 | 2 | No | 5M | 512 | Experiments |
-| `base` | 512 | 4 | (3,4,4,3) | 8 | 2 | Yes | 25M | 1024 | Pretraining |
-| `medium` | 768 | 5 | (3,4,4,4,3) | 12 | 3 | Yes | 100M | 2048 | Production small |
-| `large` | 1024 | 6 | (4,5,5,5,5,4) | 16 | 3 | Yes | 300M | 4096 | Competitive |
-| `xl` | 1536 | 6 | (5,6,6,6,6,5) | 24 | 4 | Yes | 1B | 8192 | Frontier small |
-| `xxl` | 2048 | 7 | (5,6,6,6,6,6,5) | 32 | 4 | Yes | 4B | 16384 | Near-frontier |
+| Preset | d_model | Columns | Nodes | Heads | Loops | SSM | Seq Len | Use Case |
+|--------|---------|---------|-------|-------|-------|-----|---------|----------|
+| `tiny` | 128 | 2 | (2,2) | 4 | 1 | No | 256 | Smoke test |
+| `small` | 256 | 3 | (2,3,2) | 4 | 2 | No | 512 | Experiments |
+| `base` | 512 | 4 | (3,4,4,3) | 8 | 2 | Yes | 1024 | Pretraining |
+| `medium` | 768 | 5 | (3,4,4,4,3) | 12 | 3 | Yes | 2048 | Production small |
+| `large` | 1024 | 6 | (4,5,5,5,5,4) | 16 | 3 | Yes | 4096 | Competitive |
+| `xl` | 1536 | 6 | (5,6,6,6,6,5) | 24 | 4 | Yes | 8192 | Frontier small |
+| `xxl` | 2048 | 7 | (5,6,6,6,6,6,5) | 32 | 4 | Yes | 16384 | Near-frontier |
 
 ```python
 # One-liner scaling
