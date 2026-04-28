@@ -155,13 +155,16 @@ def main():
 
     # Save
     save_path = os.path.join(os.path.dirname(__file__), "helixlm_smoke.pt")
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "config": cfg.to_dict(),
-        "char_to_id": tokenizer._char_to_id,
-        "id_to_char": tokenizer._id_to_char,
-    }, save_path)
-    print(f"\nSaved to {save_path}")
+    # Access the underlying CharTokenizer for state dict
+    backend = tokenizer._backend if tokenizer._backend_name == "char" else None
+    if backend is not None:
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "config": cfg.to_dict(),
+            "char_to_id": backend.stoi,
+            "id_to_char": backend.itos,
+        }, save_path)
+        print(f"\nSaved to {save_path}")
 
     # Acceptance
     passed = True

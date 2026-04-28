@@ -21,6 +21,8 @@ class HelixLMCore(nn.Module):
     Args:
         cfg: HelixConfig instance.
     """
+    _tied_weights_keys = {"lm_head.weight": "token_emb.weight"}
+
     def __init__(self, cfg: HelixConfig):
         super().__init__()
         self.cfg = cfg
@@ -36,8 +38,11 @@ class HelixLMCore(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         nn.init.normal_(self.lm_head.weight, std=cfg.initializer_range)
 
-        # Tie weights if desired (optional)
-        self.lm_head.weight = self.token_emb.weight
+        # Tie weights when used as standalone (smoke tests).
+        # HelixForCausalLM passes tie_word_embeddings=False and handles
+        # tying itself to stay compatible with HF save_pretrained.
+        if getattr(cfg, "tie_word_embeddings", True):
+            self.lm_head.weight = self.token_emb.weight
 
         # Precompute RoPE frequencies
         if cfg.use_rope:
@@ -87,3 +92,37 @@ class HelixLMCore(nn.Module):
     def count_parameters(self) -> int:
         """Return total trainable parameter count."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> torch.Tensor:
+        """Standard autoregressive generation."""
+        self.eval()
+        generated = input_ids.clone()
+        for _ in range(max_new_tokens):
+            logits = self(generated)
+            next_logits = logits[:, -1, :] / temperature
+
+            if top_k is not None:
+                v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                next_logits[next_logits < v[:, [-1]]] = float("-inf")
+
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_logits[indices_to_remove] = float("-inf")
+
+            probs = F.softmax(next_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated = torch.cat([generated, next_token], dim=1)
+        return generated

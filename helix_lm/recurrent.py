@@ -55,7 +55,6 @@ class HelixRecurrentBlock(nn.Module):
         """
         cfg = self.cfg
         h = x
-        act_loss = 0.0
 
         # Initialize persistent states if None
         if persistent_states is None:

@@ -141,7 +141,7 @@ class Trainer:
                 min_tail_len=min_tail_len,
             )
 
-        # AdamW with standard betas (0.9, 0.999) — 0.95 is too noisy for small batches
+        # AdamW with standard betas (0.9, 0.999)
         self.optimizer = AdamW(
             model.parameters(),
             lr=cfg.lr,
@@ -205,10 +205,10 @@ class Trainer:
                     device_type="cuda", dtype=torch.float16
                 ):
                     outputs = self.model(input_ids, labels=labels)
-                    loss = outputs["loss"]
+                    loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
             else:
                 outputs = self.model(input_ids, labels=labels)
-                loss = outputs["loss"]
+                loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
 
             # Skip NaN/Inf losses (numerical instability)
             if torch.isnan(loss) or torch.isinf(loss):
@@ -293,7 +293,7 @@ class Trainer:
             else:
                 outputs = self.model(input_ids, labels=labels)
 
-            loss = outputs["loss"]
+            loss = outputs.loss if hasattr(outputs, "loss") else outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item()
                 num_batches += 1
@@ -326,7 +326,7 @@ class Trainer:
     def save_checkpoint(self, epoch: int, filename: Optional[str] = None):
         """Save model checkpoint."""
         if filename is None:
-            filename = f"helixlm_epoch_{epoch}.pt"
+            filename = f"helixlm_epoch_{epoch}"
         path = os.path.join(self.output_dir, filename)
         self.model.save_pretrained(path)
         print(f"Checkpoint saved to {path}")
