@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from .config import HelixConfig
 from .nodes import (
     HeteroNode, LinearAttnNode, FullAttnNode, DenseNode,
-    SwiGLUNode, SSMNode, Mamba2Node, GateNode
+    SwiGLUNode, SSMNode, Mamba2Node, GateNode, TitansMemoryNode
 )
 
 
@@ -128,6 +128,17 @@ class HelixGraph(nn.Module):
                         "d_conv": cfg.ssm_d_conv, "expand": cfg.ssm_expand, "dropout": cfg.dropout,
                     }))
 
+            # Optional Titans Neural Memory — guaranteed at least once if enabled
+            if cfg.use_titans_memory:
+                if cfg.titans_always_select and ci == 0:
+                    column.append(("titans", {
+                        "d_model": cfg.d_model,
+                        "feature_dim": cfg.titans_feature_dim,
+                        "eta_init": cfg.titans_eta_init,
+                        "n_heads": cfg.titans_n_heads,
+                        "dropout": cfg.titans_dropout,
+                    }))
+
             if len(column) > 1 or ci > 0:
                 column.append(("gate", {
                     "d_model": cfg.d_model, "n_preds": len(column), "dropout": cfg.dropout,
@@ -149,6 +160,8 @@ class HelixGraph(nn.Module):
             return SSMNode(**ncfg)
         elif ntype == "mamba2":
             return Mamba2Node(**ncfg)
+        elif ntype == "titans":
+            return TitansMemoryNode(**ncfg)
         elif ntype == "gate":
             return GateNode(**ncfg)
         raise ValueError(f"Unknown node type: {ntype}")
@@ -182,24 +195,31 @@ class HelixGraph(nn.Module):
 
         for name in self.nodes:
             if not self.graph[name]:
-                cache[name] = x
+                # Stateful nodes must run forward to produce/update their state
+                if not isinstance(self.nodes[name], (SSMNode, Mamba2Node, TitansMemoryNode)):
+                    cache[name] = x
 
         for name in self.order:
             if name in cache:
                 continue
             preds = self.graph[name]
-            feats = [cache[p] for p in preds]
+            if not preds:
+                feats = []
+            else:
+                feats = [cache[p] for p in preds]
             _, _, ntype = self.node_meta[name]
 
-            if len(feats) == 1:
+            if ntype == "gate":
+                merged = feats if len(feats) > 0 else [x]  # GateNode always expects a list
+            elif len(feats) == 1:
                 merged = feats[0]
-            elif ntype == "gate":
-                merged = feats
+            elif len(feats) == 0:
+                merged = x  # Root node with no predecessors
             else:
                 merged = self.merges[name](torch.cat(feats, dim=-1))
 
             node = self.nodes[name]
-            if isinstance(node, (SSMNode, Mamba2Node)):
+            if isinstance(node, (SSMNode, Mamba2Node, TitansMemoryNode)):
                 out, s = node(merged, state=states.get(name))
                 new_states[name] = s
             elif isinstance(node, GateNode):
