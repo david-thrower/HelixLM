@@ -3,16 +3,15 @@
 
 > **Why "Helix"?** A helix coils back on itself — just as our recurrent graph reuses its weights across depth iterations, refining understanding with each loop. Biological, elegant, memorable.
 
-HelixLM is an optimized hybrid architecture for small-scale language modeling, designed for **hyperpersonalization** and **on-device AI**. It combines biological brain-inspired random graph wiring with modern SOTA primitives (hybrid attention, Mamba-2 SSD, RoPE, SwiGLU, RMSNorm) and full HuggingFace integration.
+HelixLM is an optimized hybrid architecture for small-scale language modeling, designed for **hyperpersonalization** and **on-device AI**. It combines biological brain-inspired random graph wiring with modern SOTA primitives (hybrid attention, Mamba-2 SSD, RoPE, SwiGLU, RMSNorm, optional Titans neural memory) and full HuggingFace integration.
 
 ---
 
-## Use Caases:
+## Use Cases
 
-1. **Hyperpersonalization**: A small model (100M–4B parameters) that can be trained from cold start on a personalized personal corpus, then fine tuned on anuser's own data, making the model an expert in the one thing generic frontier models just don't know: **you**: your specialized domain knowledge, personalized context, work patterns, and communication style, email history, work notes, documents, briefs and dossiers, etc.
+1. **Hyperpersonalization** — Train a small model (from sub-million to ~1B parameters) from cold start on a personal corpus, then full fine-tune on the user's own data. The model becomes an expert in the one thing generic frontier models don't know: **you** — your domain knowledge, style, notes, emails, and work patterns.
 
-2. **On-device AI**: Efficient inference on CPU/GPU for desktops, laptops, tablets, and mobile — strong quality for its parameter count, with optional log-less operation for sensitive use cases.
-
+2. **On-device AI** — Efficient inference on CPU/GPU for desktops, laptops, tablets, and mobile. Strong quality per parameter, with optional fully-local (log-less) operation for sensitive use cases.
 
 ---
 
@@ -28,16 +27,17 @@ Input Tokens
 Embedding (d_model)
     ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  Recurrent Block (n_loops × same graph weights)              │
+│  Recurrent Block (n_loops × shared graph weights)            │
 │  ├── HelixGraph: Randomly wired heterogeneous neural columns │
-│  │   ├── LinearAttnNode  : O(n) causal linear attention      │
-│  │   ├── FullAttnNode    : Causal softmax (periodic)         │
-│  │   ├── SwiGLUNode      : Modern gated activation           │
-│  │   ├── Mamba2Node      : Mamba-2 SSD (optional)           │
-│  │   ├── GateNode        : Learned multi-input aggregation    │
-│  │   └── Random wiring   : Vertical + lateral connections    │
-│  ├── LTI Injection       : Spectral-radius < 1 stability     │
-│  └── ACT Halting         : Dynamic per-token depth           │
+│  │   ├── LinearAttnNode   : O(n) causal linear attention   │
+│  │   ├── FullAttnNode     : Causal softmax (periodic)        │
+│  │   ├── SwiGLUNode       : Modern gated activation          │
+│  │   ├── Mamba2Node       : Mamba-2 SSD (long-range)         │
+│  │   ├── TitansMemoryNode : Neural long-term memory (opt.)   │
+│  │   ├── GateNode         : Learned multi-input aggregation  │
+│  │   └── Random wiring    : Vertical + lateral connections   │
+│  ├── LTI Injection        : Recurrent stability (A < 1)      │
+│  └── ACT Halting          : Dynamic per-token depth         │
 └─────────────────────────────────────────────────────────────┘
     ↓
 RMSNorm + LM Head (tied embeddings)
@@ -49,11 +49,14 @@ Logits / Generation
 
 | Component | What it does | Why it matters |
 |-----------|--------------|----------------|
-| **Neural Columns & Heterogeneous Nodes** | Each column holds diverse node types (attention variants, FFN, SSM, gate) instead of identical transformer blocks. | Different information pathways for different computations, like biological cortical columns. |
-| **Recurrent Depth (LTI + ACT)** | The same graph weights are looped `n_loops` times. LTI injection keeps the spectral radius < 1 for stable recurrence. ACT halting dynamically allocates compute per token. | Iterative refinement without parameter growth; easy tokens use 1 loop, hard reasoning uses more. |
-| **Hybrid Attention** | 80–90% linear attention (O(n) complexity) + periodic full attention layers for exact retrieval. | Long-context efficiency without losing precise copy/lookup capability. |
-| **Mamba-2 SSD** | State Space Duality implementation with chunked parallel scan. Auto-activates when `ssm_d_state >= 64`. | Handles very long-range dependencies efficiently on CPU, CUDA, or MPS. |
+| **Neural Columns & Heterogeneous Nodes** | Each column holds diverse node types (attention variants, SwiGLU, Mamba-2, gating, optional Titans memory) instead of identical transformer blocks. | Different information pathways for different computations, like biological cortical columns. |
+| **Recurrent Depth (LTI + ACT)** | The same graph weights are looped `n_loops` times. LTI injection keeps the recurrent state stable. ACT halting dynamically allocates compute per token. | Iterative refinement without parameter growth; easy tokens use 1 loop, hard reasoning uses more. |
+| **Hybrid Attention** | Linear attention (O(n) complexity) in most columns, with periodic full-attention columns for exact retrieval. | Long-context efficiency without losing precise copy/lookup capability. |
+| **Mamba-2 SSD** | State Space Duality with chunked parallel scan. Auto-activates when `ssm_d_state >= 64`. | Handles very long-range dependencies efficiently on CPU, CUDA, or MPS. |
+| **Titans Neural Memory (optional)** | Persistent surprise-gated memory via outer-product updates (first column only by default). | Test-time memory that can retain patterns across long documents without growing KV cache. |
 | **Modern Primitives** | RoPE, SwiGLU, RMSNorm, and weight tying. | Proven SOTA components for convergence and generation quality. |
+
+> **Note on column layout:** The `nodes_per_column` config field is reserved for future extensibility. In the current graph builder, every column automatically instantiates **Attention + SwiGLU + optional Mamba-2 SSD + optional Titans Memory + Gate**. `DenseNode` is defined in the codebase but not used in the default wiring recipe.
 
 ---
 
@@ -65,28 +68,24 @@ Logits / Generation
 pip install torch transformers datasets accelerate
 ```
 
-
+### Smoke Test (CPU, character-level)
 
 ```bash
 cd helix_lm
 python smoke_test.py
 ```
 
+### Minimal Demo (CPU, HuggingFace tokenizer)
 
-### 'Minimal Scalable' Example  (Train a Language Model on CPU)
-
-```sh
+```bash
 python quick_demo_cpu.py
-
 ```
 
 ---
 
-## Comparison: Where does HelixLM fit in the ecosystem and landscape
+## Comparison: Where does HelixLM fit?
 
----
-
-## The Landscape
+### The Landscape
 
 | Project | What They Do | Their Core Tech | Their Weakness |
 |---------|-------------|-----------------|----------------|
@@ -96,13 +95,11 @@ python quick_demo_cpu.py
 | **Qwen2.5 (Alibaba)** | Multilingual small LLM | Standard transformer | No graph wiring; no recurrent depth; no SSM integration |
 | **Mamba-2 (Tri Dao)** | Efficient SSM | State Space Duality | Not a complete LLM architecture; needs integration |
 | **Kimi Linear** | Linear attention at scale | Hybrid linear + full attention | Not open source; no graph wiring |
-| **HelixLM (Ours)** | **All of the above, integrated** | **Graph + Recurrent + Hybrid Attention + Mamba-2** | **Small team; needs compute for 1B+ scaling** |
+| **HelixLM (Ours)** | **All of the above, integrated** | **Graph + Recurrent + Hybrid Attention + Mamba-2 + Titans** | **Small team; needs community compute for 1B+ scaling** |
 
----
+### HelixLM vs. OpenMythos
 
-## HelixLM vs. its community predecessor, OpenMythos
-
-OpenMythos pioneered recurrent depth (looping over the same attention block) with LTI stability and ACT halting. We took that insight and **made it work inside a **heterogeneous** graph mimicking neural column and random topology connectiviety found in biological neurons.
+OpenMythos pioneered recurrent depth with LTI stability and ACT halting. HelixLM takes that insight and makes it work inside a **heterogeneous** graph that mimics neural column and random topology connectivity found in biological brains.
 
 | Capability | OpenMythos | HelixLM |
 |-----------|-----------|---------|
@@ -111,31 +108,31 @@ OpenMythos pioneered recurrent depth (looping over the same attention block) wit
 | **ACT halting** | ✅ Dynamic per-token depth | ✅ Dynamic per-token depth |
 | **Architecture inside loop** | Standard transformer block | **Heterogeneous random graph** |
 | **Attention** | Standard full attention only | **Linear + full hybrid** |
-| **Node types** | Single (transformer block) | **7 types (attention variants, FFN, SSM, gate)** |
+| **Node types** | Single (transformer block) | **7+ active types (attention variants, FFN, SSM, gate, neural memory)** |
 | **Positional encoding** | Standard learned | **RoPE** |
 | **Activation** | GELU | **SwiGLU** |
 | **Normalization** | LayerNorm | **RMSNorm** |
 | **Open source** | ✅ Yes | ✅ Yes |
 | **HF integration** | ❌ No | ✅ **Full PreTrainedModel** |
 
-## HelixLM vs. its inernal predecessor, CerebrosNotGPT 
+### HelixLM vs. Cerebros
 
-Cerebros (the original inspiration https://github.com/david-thrower/cerebros-core-algorithm-alpha/) had the insight that biological neural connectivity, random hyperdense vertical and lateral topology of Dense layyers could outperform rigid layer stacks or sparse sequential connectivity and proved to be a promising component of an LLM. It was able to generate text without attention layers with a small model and small trainig corpus, boostable with attention hybridization, but required elaborate integration and clashed in model structure paradigm.
+[Cerebros](https://github.com/david-thrower/cerebros-core-algorithm-alpha/) showed that biological random hyperdense vertical and lateral topology of Dense layers could outperform rigid layer stacks. It generated text without attention on small data, but required elaborate integration and clashed with standard model-structure paradigms. HelixLM integrates that topological insight into a modern, HF-compatible LLM backbone.
 
 ---
 
-## The "Why HelixLM?" in Practice?
+## Why HelixLM in Practice?
 
-### For Hyperpersonalization (Use Case 1)
+### Hyperpersonalization
 
 | Requirement | How HelixLM Delivers |
 |-------------|---------------------|
-| Small enough to train per-user | **0.5M–1B params** = trainable on single GPU in hours / full weights fine tuning foe the cost of higher - rank LoRA |
+| Small enough to train per-user | **0.4M–1.2B params** = trainable on single GPU in hours |
 | Rich enough to capture user style | **Heterogeneous graph** routes different info types through optimal processing paths |
 | Fast inference for tool calls | **Linear attention** gives O(n) complexity; **ACT** skips unnecessary depth |
 | Queryable by frontier model | **HF integration** = standard API; **chat templates** = structured responses |
 
-### For On-Device AI (Use Case 2)
+### On-Device AI
 
 | Requirement | How HelixLM Delivers |
 |-------------|---------------------|
@@ -147,55 +144,33 @@ Cerebros (the original inspiration https://github.com/david-thrower/cerebros-cor
 
 ---
 
-## Parameter Efficiency Comparison
+## Parameter Efficiency & Scaling
 
-1. Recurrent loops reuse weights (depth without parameter growth)
-2. Graph wiring creates expressive pathways without wide layers
-3. Heterogeneous nodes specialize (no wasted capacity)
+Recurrent loops reuse weights (depth without parameter growth). Graph wiring creates expressive pathways without wide uniform layers. Heterogeneous nodes specialize, so no capacity is wasted on uniform operations.
 
----
+Because the graph is the bulk of the model, parameter counts are shown for **two common vocabularies**: a minimal character-level vocab (~100 tokens) and the GPT-2 BPE vocab (50,257 tokens). Both assume **tied embeddings/head**.
 
-## Summary Matrix
+| Preset | d_model | Columns | Heads | Loops | SSM | **~Params (Char)** | **~Params (GPT-2)** | Seq Len | Use Case |
+|--------|---------|---------|-------|-------|-----|-------------------|---------------------|---------|----------|
+| `tiny` | 128 | 2 | 4 | 1 | No | **0.4M** | **6.9M** | 256 | Smoke test |
+| `small` | 256 | 3 | 4 | 2 | No | **2.6M** | **15.5M** | 512 | Experiments |
+| `base` | 512 | 4 | 8 | 2 | Yes | **31M** | **56M** | 1024 | Serious pretraining |
+| `medium` | 768 | 5 | 12 | 3 | Yes | **88M** | **126M** | 2048 | Production small |
+| `large` | 1024 | 6 | 16 | 3 | Yes | **188M** | **240M** | 4096 | Competitive |
+| `xl` | 1536 | 6 | 24 | 4 | Yes | **505M** | **582M** | 8192 | Frontier small |
+| `xxl` | 2048 | 7 | 32 | 4 | Yes | **1.24B** | **1.35B** | 16384 | Near-frontier |
 
-| Feature | OpenMythos | Cerebros | Phi-2 | Qwen | Mamba-2 | HelixLM |
-|---------|-----------|----------|-------|------|---------|---------|
-| Recurrent depth | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Graph-based state | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
-| Biological graph | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ |
-| Heterogeneous nodes | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Hybrid attention | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| SSM backbone | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| Stable recurrent dynamics | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| LTI stability | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| ACT halting | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| RoPE | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| SwiGLU | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| RMSNorm | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| HF Integration | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| Multi-tokenizer | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Rolling dataset | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| Multimodal hooks | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+> **How to read the table:** At small scale the GPT-2 embedding dominates the parameter budget. At `xxl`, the heterogeneous graph dominates (~1.24B) and the vocabulary adds only ~8%. If you train on a custom tiny vocabulary, you can cut millions to billions of parameters from the embedding layer.
 
-
-**HelixLM is the only architecture that combines all of these.**
+```python
+# One-liner scaling
+cfg = HelixConfig.medium(vocab_size=151936, tokenizer_name="qwen")
+model = HelixForCausalLM(cfg)
+```
 
 ---
 
-
-## Key Differentiators
-
-| Feature | Typical Small LLM | HelixLM |
-|---------|------------------|---------|
-| Architecture | Stack of identical blocks | **Random heterogeneous graph** |
-| Depth | Fixed N layers | **Dynamic (ACT halting)** + recurrent loops |
-| Attention | All full or all linear | **Hybrid: linear + periodic full** |
-| State model | None or pure Mamba | **LTI-stable recurrence** |
-| Node types | Uniform | **6 heterogeneous types** |
-| Scalability | Fixed recipes | **Continuous: 0.5M → 4B+ via config** |
-
----
-
-### HuggingFace Integration
+## HuggingFace Integration
 
 ```python
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer
@@ -213,6 +188,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained("./my-helix-model")
 tokenizer = AutoTokenizer.from_pretrained("./my-helix-model")
 ```
+
 ---
 
 ## Tokenizer Support
@@ -243,19 +219,28 @@ tokenizer.build_char_vocab("some text here")
 
 ---
 
-## Example Forward pass
+## Forward Pass & Generation
 
-```
+```python
 import torch
+
+# Forward
 input_ids = torch.tensor([tokenizer.encode("Hello world")])
 logits = model(input_ids)
-```
 
-## Examle Generate
-
-```
+# Standard generation
 generated = model.generate(input_ids, max_new_tokens=50, temperature=0.8, top_k=50)
 text = tokenizer.decode(generated[0])
+
+# Extended generation with stop-string detection
+generated = model.generate_ext(
+    input_ids,
+    max_new_tokens=2000,
+    temperature=0.8,
+    top_k=50,
+    top_p=0.95,
+    stop_strings=["</s>", "\n\n"],
+)
 ```
 
 ---
@@ -291,7 +276,11 @@ loader = create_helix_dataloader(
 
 ### Natural Stop Detection
 
-Each sample includes `is_natural_stop`: True if the chunk ends at a document boundary (as opposed to an artificial slice). This lets the model learn to distinguish natural endings from forced truncations.
+Each sample includes `is_natural_stop`: `True` if the chunk ends at a document boundary. This lets the model learn to distinguish natural endings from forced truncations.
+
+### Document-Aware Chunking (No Boundary Crossings)
+
+`DocumentAwareDataset` splits documents into non-overlapping chunks without crossing document boundaries. Only padding positions are masked in labels, giving 100% token utilization on real text.
 
 ### HuggingFace Streaming
 
@@ -310,7 +299,7 @@ hf_dataset = HelixHFDataset(
 
 ## Configuration & Parameters
 
-HelixLM scales from **0.5M to 4B+ parameters** through a single configuration class. Below are the key knobs and their practical effects.
+HelixLM scales from **0.4M to 1.3B+ parameters** through a single configuration class. Below are the key knobs and their practical effects.
 
 ### Core Dimensions
 
@@ -318,7 +307,6 @@ HelixLM scales from **0.5M to 4B+ parameters** through a single configuration cl
 |-----------|--------|---------------|
 | `d_model` | Width of the model; determines embedding and hidden dimension. | 128 for smoke tests; 768–1536 for production-quality small models. |
 | `n_columns` | Number of neural columns (graph depth). | 2–4 for fast experiments; 6–7 for large models. |
-| `nodes_per_column` | Nodes placed in each column. | More nodes = denser lateral connectivity and richer pathways. |
 | `n_loops` | How many times the graph is recurrently executed. | 1 for speed; 3–4 for iterative reasoning depth. |
 | `n_heads` | Attention heads for attention nodes. | Must divide `d_model`. 4–8 for small models; 16–32 for large. |
 
@@ -330,36 +318,20 @@ HelixLM scales from **0.5M to 4B+ parameters** through a single configuration cl
 | `hybrid_full_attention_interval` | How often to place a full-attention column in hybrid mode. | 3 or 4 (i.e., every 3rd/4th column is full attention). |
 | `use_ssm` | Enables Mamba-2 SSD nodes in the graph. | Turn on for long-context or stateful tasks. |
 | `ssm_d_state` | State dimension for Mamba-2. | Must be `>= 64` to activate the optimized Mamba-2 path; smaller values use a simplified SSM. |
+| `use_titans_memory` | Adds a Titans neural memory node to the first column. | Useful for very long documents; still experimental. |
 | `seq_len` | Training context window. | Can generate far beyond this at inference time thanks to recurrent state. |
 
 ### Training & Stability
 
 | Parameter | Effect | Practical Tip |
 |-----------|--------|---------------|
-| `ffn_expansion` | Hidden dimension multiplier for FFN/SwiGLU nodes. | 2.0 is standard; 2.5–3.0 for XL/XXL presets. |
+| `ffn_expansion` | Hidden dimension multiplier for SwiGLU nodes. | 2.0 is standard; 2.5–3.0 for XL/XXL presets. |
 | `act_threshold` | Confidence threshold for Adaptive Computation Time halting. | 0.99 is conservative. Reduce to 0.95 if you want deeper per-token thinking. |
 | `dropout` | Regularization rate. | 0.0–0.05 for small models; higher for large datasets. |
 | `lr` / `weight_decay` | AdamW optimizer settings. | 3e-4 with 0.1 decay works well for small models. |
 | `grad_clip` | Max gradient norm. | Keep at 1.0 to prevent spikes in graph architectures. |
 
 ---
-
-## Scaling Guide / Preset recipes
-
-| Preset | d_model | Columns | Nodes | Heads | Loops | SSM | ~Params | Seq Len | Use Case |
-|--------|---------|---------|-------|-------|-------|-----|---------|---------|----------|
-| `tiny` | 128 | 2 | (2,2) | 4 | 1 | No | 0.5M | 256 | Smoke test |
-| `small` | 256 | 3 | (2,3,2) | 4 | 2 | No | 5M | 512 | Experiments |
-| `base` | 512 | 4 | (3,4,4,3) | 8 | 2 | Yes | 25M | 1024 | Pretraining |
-| `medium` | 768 | 5 | (3,4,4,4,3) | 12 | 3 | Yes | 100M | 2048 | Production small |
-| `large` | 1024 | 6 | (4,5,5,5,5,4) | 16 | 3 | Yes | 300M | 4096 | Competitive |
-| `xl` | 1536 | 6 | (5,6,6,6,6,5) | 24 | 4 | Yes | 1B | 8192 | Frontier small |
-| `xxl` | 2048 | 7 | (5,6,6,6,6,6,5) | 32 | 4 | Yes | 4B | 16384 | Near-frontier |
-
-```python
-# One-liner scaling
-cfg = HelixConfig.medium(vocab_size=151936, tokenizer_name="qwen")
-```
 
 ## Generation Features
 
@@ -369,21 +341,20 @@ cfg = HelixConfig.medium(vocab_size=151936, tokenizer_name="qwen")
 # Standard generation (uses full model each step)
 generated = model.generate(input_ids, max_new_tokens=200)
 
-# Extended generation via HelixForCausalLM (uses only last token, with cache)
+# Extended generation via HelixForCausalLM (uses only last token, with truncation)
 generated = model.generate_ext(
     input_ids,
     max_new_tokens=2000,  # Far beyond training seq_len
     temperature=0.8,
     top_k=50,
     top_p=0.95,
-    stop_strings=["</s>", "\n\n"],  # Stop on strings, not just tokens
+    stop_strings=["</s>", "\n\n"],
 )
 ```
 
 ### Stop String Detection
 
 ```python
-# Stop on specific strings, not just EOS tokens
 model.generate_ext(
     input_ids,
     max_new_tokens=100,
@@ -394,11 +365,12 @@ model.generate_ext(
 ### Batched Generation
 
 ```python
-# Generate multiple sequences in parallel
 prompts = ["The weather is", "In 1492,", "Once upon a time"]
 batch = torch.stack([torch.tensor(tokenizer.encode(p)) for p in prompts])
 results = model.generate(batch, max_new_tokens=30)
 ```
+
+---
 
 ## Chat Template Support
 
@@ -408,7 +380,6 @@ messages = [
     {"role": "user", "content": "What is the capital of France?"},
 ]
 
-# With Qwen-style tokenizer
 input_ids = tokenizer.apply_chat_template(
     messages,
     tokenize=True,
@@ -416,10 +387,11 @@ input_ids = tokenizer.apply_chat_template(
     return_tensors="pt",
 )
 
-# Generate response
 output = model.generate_ext(input_ids, max_new_tokens=50)
 response = tokenizer.decode(output[0][input_ids.shape[-1]:])
 ```
+
+---
 
 ## Mamba-2 SSD Integration
 
@@ -438,6 +410,8 @@ cfg = HelixConfig.medium(
 )
 ```
 
+---
+
 ## VLM Extensibility (Future-Ready)
 
 HelixLM includes architecture hooks for vision-language integration:
@@ -452,19 +426,24 @@ cfg = HelixConfig.base(
     fusion_strategy="perceiver",  # "perceiver" or "simple_merge"
 )
 
-# Will expose:
-#   HelixForImageTextToText  (future)
+# Future:
+#   HelixForImageTextToText
 #   processor.apply_chat_template with images
 ```
 
+---
+
 ## Training Best Practices
 
-1. **Warmup + Cosine Decay**: Linear warmup (default 100 steps) followed by cosine decay to 0.1× base LR
-2. **Gradient Clipping**: Max norm 1.0 prevents spikes in graph architectures
-3. **Weight Decay**: 0.1 for small models, 0.01 for large
-4. **Mixed Precision**: Automatic `torch.cuda.amp` when CUDA available
-5. **Streaming**: `HelixDataset` supports corpora larger than RAM
-6. **Data Quality**: For small models, data quality > quantity. Curate aggressively.
+1. **Warmup + Cosine Decay**: Linear warmup followed by cosine decay to 0.1× base LR.
+2. **Gradient Clipping**: Max norm 1.0 prevents spikes in graph architectures.
+3. **Weight Decay**: 0.1 for small models, 0.01 for large.
+4. **Mixed Precision**: Use `torch.cuda.amp` only on Ampere+ GPUs for XL/XXL; keep it off for tiny/small to avoid NaNs.
+5. **Streaming**: `HelixDataset` supports corpora larger than RAM.
+6. **No Cross-Document Boundaries**: Use `DocumentAwareDataset` to avoid pollution of gradient signal at document seams.
+7. **Data Quality**: For small models, data quality > quantity. Curate aggressively.
+
+---
 
 ## Project Structure
 
@@ -474,42 +453,7 @@ helix_lm/
   config.py             - HelixConfig with 7 presets
   tokenizer.py          - Multi-backend tokenizer (char / GPT-2 / Qwen / custom)
   rope.py               - Rotary positional embeddings
-  nodes.py              - 7 heterogeneous node types
-  graph.py              - HelixGraph executor with random wiring
-  recurrent.py          - Recurrent block (LTI + ACT)
-  model.py              - HelixLMCore (non-HF)
-  hf_model.py           - HelixForCausalLM (HF PreTrainedModel)
-  dataset.py            - Rolling chunking, streaming, HF datasets
-  trainer.py            - Production training loop
-  mamba2.py             - Mamba-2 SSD with parallel scan
-  smoke_test.py         - Self-contained CPU test
-examples/
-  train_hf_full.py      - HF tokenizer + training example
-```
-
----
-
-## Acknowledgements
-
-This project would not be possible without the support, insight, and contributions of many people and communities.
-
-- **Family:** My Jennifer and my step-kids. My son **Aidyn** (also a cofounder), daughter **Jenna**, and the rest of my family for their patience and encouragement.
-- **Cofounders:** **Aidyn Lopez**, **Moises Perez**, **Alexander Kolpakov**, and **Jeffly Archellus** — thank you for building alongside me.
-- **Colleagues:** My colleagues who I work with every day — your collaboration pushes this forward.
-- **Open Source Communities:** The TensorFlow, Keras, PyTorch, MLflow, Kubeflow, Kale, Optuna, Keras Tuner, and Ray open source communities and contributors and many others have been instrumental to this. Your tools are the foundation we build on.
-- **AI Research Community** Kye Gomez who published OpenMythos (https://github.com/kyegomez/OpenMythos and his team), the teams at OpenAI, Qwen, Kimi, Google, MIT AI Lab, and many others who crafted many of the foundational bricks used to build this.
-- **Infrastructure Partners, past and present:** AWS, Innovative Solutions, Google Cloud Platform, Arrikto, Canonical, and Paperspace and their support staff — for past and present operational contributions.
-- **Investors:** **AI Forge; Jennifer**, our pre-seed round investors, for backing this vision early.
-
----
-
-```
-helix_lm/
-  __init__.py           - Package exports
-  config.py             - HelixConfig (PretrainedConfig) with 7 presets
-  tokenizer.py          - Multi-backend tokenizer (char/gpt2/qwen/custom)
-  rope.py               - Rotary positional embeddings
-  nodes.py              - 7 heterogeneous node types
+  nodes.py              - Heterogeneous node types (7+ active, Dense defined)
   graph.py              - HelixGraph executor with random wiring
   recurrent.py          - Recurrent block (LTI + ACT)
   model.py              - HelixLMCore (non-HF)
@@ -518,34 +462,23 @@ helix_lm/
   trainer.py            - Production training loop
   mamba2.py             - Mamba-2 SSD with parallel scan
   smoke_test.py         - Self-contained CPU test
+examples/
+  train_hf_full.py      - HF tokenizer + training example
+  quick_demo_cpu.py     - Minimal CPU demo
 ```
 
 ---
 
-## Existing Research We Build On Top Of
+## Existing Research We Build On
 
-### Hybrid Attention
-
-Pure linear attention cannot do exact retrieval. Interleaving linear layers with periodic full attention layers gives O(n) efficiency + exact copying. Default ratio: 3:1 or 4:1 linear-to-full.
-
-### Recurrent Depth (OpenMythos / Universal Transformers)
-
-Reusing the same block weights across depth iterations:
-- Reduces parameter count (same weights do more work)
-- Improves generalization (iterative refinement)
-- Enables dynamic depth via ACT halting
-
-### LTI Stability
-
-The `LTIInjection` module constrains the spectral radius to < 1 using log-parameterized A, preventing exploding/vanishing gradients in deep recurrence.
-
-### Mamba-2 SSD
-
-Mamba-2 unifies attention and SSM through structured state space duality. Our implementation uses PyTorch associative scan (chunked for large sequences) for efficient training.
-
-### Biological Graph Wiring (Cerebros)
-
-Random vertical and lateral connections create multiple information pathways of varying depth. Lateral connections preserve fine-grained details that would be lost in a strict feedforward stack.
+| Idea | Source / Inspiration | How we use it |
+|------|---------------------|---------------|
+| **Hybrid Attention** | Linear + full attention interleaving | 3:1 or 4:1 linear-to-full ratio; O(n) training with exact copy layers |
+| **Recurrent Depth** | OpenMythos / Universal Transformers | Same graph weights looped `n_loops` times; fewer params, iterative refinement |
+| **LTI Stability** | OpenMythos | Log-parameterized state decay to keep spectral radius < 1 |
+| **Mamba-2 SSD** | Dao & Gu (2024) | Chunked associative scan for selective SSM; auto-enabled at `d_state >= 64` |
+| **Biological Graph Wiring** | Cerebros / Random DAGs | Random vertical & lateral edges instead of strict feedforward stacks |
+| **Titans Neural Memory** | Behrouz et al. (2025) | Optional first-column persistent memory with surprise-gated outer-product updates |
 
 ---
 
@@ -553,11 +486,10 @@ Random vertical and lateral connections create multiple information pathways of 
 
 This project is open-source under a modified Apache 2.0 license. Please see the [license.md](license.md) file for full terms and conditions.
 
-
 ```bibtex
-@software{helixlm2025,
+@software{helixlm2026,
   title = {HelixLM: Recurrent Heterogeneous Graph Neural Language Model},
-  year = {2025},
+  year = {2026},
   note = {Open-source small language model architecture}
 }
 ```
