@@ -44,7 +44,7 @@ jobs:
       timeout-minutes: 60
       run: |
         python3 quick_demo_cpu.py
-    - name: Demo run - Titan
+    - name: Demo run - Titans Memory
       timeout-minutes: 60
       run: |
-        python3 quick_demo_cpu-titans-mem.py
+        python3 quick_demo_cpu_titans_mem.py
