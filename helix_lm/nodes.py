@@ -271,3 +271,121 @@ class GateNode(HeteroNode):
         out = sum(w * x for w, x in zip(weights, x_list))
         out = self.out_proj(out)
         return self.dropout(out), None
+
+
+
+class TitansMemoryNode(HeteroNode):
+    """
+    Titans-style neural long-term memory node for HelixLM.
+
+    Maintains persistent memory across forward passes using a surprise-gated
+    delta rule. Compatible with the existing heterogeneous graph interface.
+
+    Architecture (based on Behrouz et al. 2025 "Titans: Learning to Memorize
+    at Test Time" MAC variant):
+        - Keys and values are projected from the input hidden states.
+        - A persistent memory tensor M (batch, feature_dim, d_model) stores
+          the long-term key->value mapping via outer-product updates.
+        - Surprise metric = ||v_pred - v_true|| drives update magnitude.
+        - Retrieval uses query projection + ELU feature map.
+
+    The memory tensor is returned as ``state`` and can be persisted across
+    chunks by the caller (HelixRecurrentBlock / HelixLMCore).
+    """
+    def __init__(
+        self,
+        d_model: int,
+        feature_dim: int = 64,
+        eta_init: float = 0.01,
+        n_heads: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__(d_model)
+        self.feature_dim = feature_dim
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        # Projections for memory keys, values, and retrieval queries
+        self.k_proj = nn.Linear(d_model, feature_dim, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.q_proj = nn.Linear(d_model, feature_dim, bias=False)
+
+        # Learnable per-coordinate learning rate for memory updates
+        self.eta = nn.Parameter(torch.ones(feature_dim) * eta_init)
+
+        # Feature map: ELU + 1 (standard in Titans / linear attention literature)
+        self.phi = lambda x: F.elu(x, alpha=1.0) + 1.0
+
+        # Output projection and dropout
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+
+    def _init_memory(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Initialize a zero memory tensor for a new batch."""
+        return torch.zeros(batch_size, self.feature_dim, self.d_model, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        state: Any = None,
+        cache: Any = None,
+    ) -> Tuple[torch.Tensor, Any]:
+        """
+        Args:
+            x: (B, T, D) input hidden states.
+            state: Previous persistent memory tensor (B, feature_dim, D) or None.
+            cache: Unused (for API compatibility).
+
+        Returns:
+            (output, updated_memory) where updated_memory has shape
+            (B, feature_dim, D) and should be passed back on the next chunk.
+        """
+        B, T, D = x.shape
+        device, dtype = x.device, x.dtype
+
+        # 1. Retrieve or initialize persistent memory
+        if state is not None:
+            M = state  # (B, feature_dim, D)
+        else:
+            M = self._init_memory(B, device, dtype)
+
+        # 2. Pre-norm and project to keys / values
+        x_norm = self.norm(x)
+
+        k = self.phi(self.k_proj(x_norm))  # (B, T, feature_dim)
+        v = self.v_proj(x_norm)             # (B, T, d_model)
+
+        # 3. Memory update loop (test-time learning)
+        eta = self.eta.abs().clamp(min=1e-6)  # (feature_dim,)
+
+        for t in range(T):
+            k_t = k[:, t, :]          # (B, feature_dim)
+            v_t = v[:, t, :]          # (B, d_model)
+
+            # Surprise metric: deviation of memory prediction from true value
+            v_pred = torch.einsum('bf,bfd->bd', k_t, M)
+            surprise = torch.norm(v_t - v_pred, dim=-1, keepdim=True)  # (B, 1)
+
+            # Delta rule update: outer product of key and value
+            delta = torch.matmul(k_t.unsqueeze(-1), v_t.unsqueeze(1))
+
+            # Surprise-gated update with learnable per-coordinate LR
+            M = M + eta.view(1, -1, 1) * surprise.unsqueeze(-1) * delta
+
+            # Layer norm over the feature_dim dimension to prevent explosion
+            M = F.layer_norm(M, M.shape[-2:])
+
+        # 4. Memory retrieval for output
+        q = self.phi(self.q_proj(x_norm))  # (B, T, feature_dim)
+        mem_out = torch.einsum('btf,bfd->btd', q, M)  # (B, T, d_model)
+
+        # 5. Output projection + residual
+        out = self.dropout(self.out_proj(mem_out))
+        output = x + out
+
+        return output, M

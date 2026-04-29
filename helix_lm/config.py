@@ -60,6 +60,14 @@ class HelixConfig(PretrainedConfig):
         ssm_conv_bias: bool = True,
         ssm_bias: bool = False,
 
+        # --- Titans Neural Memory ---
+        use_titans_memory: bool = False,
+        titans_feature_dim: int = 64,
+        titans_eta_init: float = 0.01,
+        titans_n_heads: int = 4,
+        titans_dropout: float = 0.0,
+        titans_always_select: bool = True,
+
         # --- Recurrent depth ---
         n_loops: int = 2,
         act_threshold: float = 0.99,
@@ -155,6 +163,14 @@ class HelixConfig(PretrainedConfig):
         self.ssm_dt_rank = ssm_dt_rank
         self.ssm_conv_bias = ssm_conv_bias
         self.ssm_bias = ssm_bias
+
+        # --- Titans ---
+        self.use_titans_memory = use_titans_memory
+        self.titans_feature_dim = titans_feature_dim
+        self.titans_eta_init = titans_eta_init
+        self.titans_n_heads = titans_n_heads
+        self.titans_dropout = titans_dropout
+        self.titans_always_select = titans_always_select
 
         # --- Recurrent ---
         self.n_loops = n_loops
