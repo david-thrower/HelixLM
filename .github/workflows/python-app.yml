@@ -43,3 +43,6 @@ jobs:
     - name: Demo run 
       run: |
         python3 quick_demo_cpu.py
+    - name: Demo run - Titan
+      run: |
+        quick_demo_cpu-titans-mem.py
