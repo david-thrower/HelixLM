@@ -222,7 +222,13 @@ class Trainer:
 
             # Scale loss for gradient accumulation
             if self.grad_accum_steps > 1:
-                loss = loss / self.grad_accum_steps
+                # If this is the final, incomplete accumulation step, divide by actual count
+                is_last = (batch_idx + 1) == len(self.train_loader)
+                if is_last and accum_count < self.grad_accum_steps - 1:
+                    divisor = accum_count + 1   # +1 because we haven't incremented yet
+                else:
+                    divisor = self.grad_accum_steps
+                loss = loss / divisor
 
             # Backward pass
             if self.use_amp and self.scaler is not None:
