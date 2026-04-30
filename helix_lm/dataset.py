@@ -200,7 +200,7 @@ class DocumentAwareDataset(Dataset):
                 dropped_short += 1
                 continue
 
-            if add_eos and self.eos_id is not None and self.eos_id != self.pad_id:
+            if add_eos and self.eos_id is not None:
                 ids.append(self.eos_id)
 
             n_full = len(ids) // seq_len
