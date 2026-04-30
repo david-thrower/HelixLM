@@ -152,13 +152,13 @@ Because the graph is the bulk of the model, parameter counts are shown for **two
 
 | Preset | d_model | Columns | Heads | Loops | SSM | **~Params (Char)** | **~Params (GPT-2)** | Seq Len | Use Case |
 |--------|---------|---------|-------|-------|-----|-------------------|---------------------|---------|----------|
-| `tiny` | 128 | 2 | 4 | 1 | No | **0.4M** | **6.9M** | 256 | Smoke test |
-| `small` | 256 | 3 | 4 | 2 | No | **2.6M** | **15.5M** | 512 | Experiments |
-| `base` | 512 | 4 | 8 | 2 | Yes | **31M** | **56M** | 1024 | Serious pretraining |
-| `medium` | 768 | 5 | 12 | 3 | Yes | **88M** | **126M** | 2048 | Production small |
-| `large` | 1024 | 6 | 16 | 3 | Yes | **188M** | **240M** | 4096 | Competitive |
-| `xl` | 1536 | 6 | 24 | 4 | Yes | **505M** | **582M** | 8192 | Frontier small |
-| `xxl` | 2048 | 7 | 32 | 4 | Yes | **1.24B** | **1.35B** | 16384 | Near-frontier |
+| `tiny` | 128 | 2 | 4 | 1 | No | **496,006** | **20M** | 256 | Smoke test |
+| `small` | 256 | 3 | 4 | 2 | No | **-** | **-** | 512 | Experiments |
+| `base` | 512 | 4 | 8 | 2 | Yes | **-** | **-** | 1024 | Serious pretraining |
+| `medium` | 768 | 5 | 12 | 3 | Yes | **-** | **-** | 2048 | Production small |
+| `large` | 1024 | 6 | 16 | 3 | Yes | **-** | **-** | 4096 | Competitive |
+| `xl` | 1536 | 6 | 24 | 4 | Yes | **-** | **-** | 8192 | Frontier small |
+| `xxl` | 2048 | 7 | 32 | 4 | Yes | **-** | **-** | 16384 | Near-frontier |
 
 > **How to read the table:** At small scale the GPT-2 embedding dominates the parameter budget. At `xxl`, the heterogeneous graph dominates (~1.24B) and the vocabulary adds only ~8%. If you train on a custom tiny vocabulary, you can cut millions to billions of parameters from the embedding layer.
 
