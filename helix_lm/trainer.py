@@ -265,6 +265,7 @@ class Trainer:
                 continue
 
             # Scale loss for gradient accumulation
+            divisor = 1
             if self.grad_accum_steps > 1:
                 is_last = (batch_idx + 1) == len(self.train_loader)
                 if is_last and accum_count < self.grad_accum_steps - 1:
@@ -280,7 +281,7 @@ class Trainer:
                 loss.backward()
 
             accum_count += 1
-            total_loss += loss.item() * max(1, self.grad_accum_steps)
+            total_loss += loss.item() * divisor
             raw_count += 1
 
             # Optimizer step after accumulation
@@ -470,3 +471,4 @@ class Trainer:
         if self.verbose:
             print(f"\nTraining complete!")
         return self.history
+
