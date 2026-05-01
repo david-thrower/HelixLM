@@ -61,7 +61,7 @@ class HelixConfig(PretrainedConfig):
         ssm_bias: bool = False,
 
         # --- Titans Neural Memory ---
-        use_titans_memory: bool = False,
+        use_titans_memory: bool = True,
         titans_feature_dim: int = 64,
         titans_eta_init: float = 0.01,
         titans_n_heads: int = 4,

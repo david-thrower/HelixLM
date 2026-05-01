@@ -6,6 +6,7 @@ Provides full compatibility with the transformers ecosystem:
   - KV-cache generation beyond max_seq_len
   - Batched generation with stop token / stop string detection
   - save_pretrained / from_pretrained / push_to_hub
+  - Automatic device placement when config.device="auto"
 """
 import math
 from typing import Optional, List, Dict, Any, Tuple, Union
@@ -101,6 +102,23 @@ class HelixPreTrainedModel(PreTrainedModel):
         """Override to return empty dict — we handle weight tying manually."""
         return {}
 
+    def to_device(self, device: Optional[Union[str, torch.device]] = None) -> "HelixPreTrainedModel":
+        """Move model to the specified device, or auto-detect if None."""
+        if device is None:
+            device = self._resolve_device()
+        return self.to(device)
+
+    def _resolve_device(self) -> torch.device:
+        """Resolve device from config or auto-detect."""
+        cfg_device = getattr(self.config, "device", "auto")
+        if cfg_device == "auto":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                return torch.device("mps")
+            return torch.device("cpu")
+        return torch.device(cfg_device)
+
 
 class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
     """
@@ -117,6 +135,19 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
 
         # KV cache for generation
         self._kv_cache: Optional[HelixKVCache] = None
+
+        # Auto device placement
+        target_device = self._resolve_device()
+        if target_device.type == "cpu" and torch.cuda.is_available():
+            import warnings
+            warnings.warn(
+                f"HelixConfig.device='{getattr(config, 'device', 'auto')}' resolved to CPU, "
+                f"but CUDA is available. Model will run on CPU. "
+                f"Call model.to('cuda') or set config.device='cuda' to use GPU.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.to(target_device)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed

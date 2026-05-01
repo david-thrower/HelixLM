@@ -53,7 +53,8 @@ def main():
     cfg = HelixConfig.tiny(
         vocab_size=VOCABULARY_SIZE,
         seq_len=MAX_SEQ_LEN,
-        tokenizer_name="gpt2")
+        tokenizer_name="gpt2",
+        use_titans_memory=False)
 
     cfg.pad_token_id = tokenizer.pad_token_id
     cfg.eos_token_id = tokenizer.eos_token_id

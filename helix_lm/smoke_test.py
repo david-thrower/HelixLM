@@ -104,6 +104,7 @@ def main():
         epochs=30,
         grad_clip=1.0,
         tokenizer_name="char",
+        use_titans_memory=False,
     )
 
     # Load data
