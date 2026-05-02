@@ -194,12 +194,13 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
-            # Shift for next-token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # CRITICAL: use -100 to support sliding-window warmup masking
+            shift_logits = logits[:, :-1, :].reshape(-1, self.config.vocab_size)
+            shift_labels = labels[:, 1:].reshape(-1)
+            if getattr(self.config, "memory_efficient_forward", False):
+                del logits
+                logits = None
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+            loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,)
