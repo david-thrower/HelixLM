@@ -169,19 +169,14 @@ class HelixDataset(Dataset):
                 labels[-pad_len:] = [-100] * pad_len
             return self._make_sample(chunk, labels, is_natural_stop=True)
 
-    def _make_sample(self, chunk: List[int], labels: List[int], is_natural_stop: bool) -> Dict[str, torch.Tensor]:
-        """Create a sample dictionary from chunk."""
+    def _make_sample(self, chunk, labels, is_natural_stop):
         input_ids = torch.tensor(chunk[:self.seq_len], dtype=torch.long)
-        labels_tensor = torch.tensor(labels[:self.seq_len], dtype=torch.long)
-        labels_tensor = torch.where(
-            labels_tensor == self.tokenizer.pad_token_id,
-            torch.tensor(-100, dtype=torch.long),
-            labels_tensor,
-        )
+        labels_t = torch.tensor(labels[:self.seq_len], dtype=torch.long)
+        # DO NOT blanket-mask pad_token_id here — pad_token_id may equal eos_token_id.
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         return {
             "input_ids": input_ids,
-            "labels": labels_tensor,
+            "labels": labels_t,
             "attention_mask": attention_mask,
             "is_natural_stop": torch.tensor(is_natural_stop, dtype=torch.bool),
         }
@@ -291,7 +286,17 @@ class DocumentAwareDataset(Dataset):
         chunk, is_natural = self.chunks[idx]
         x = torch.tensor(chunk, dtype=torch.long)
         labels = x.clone()
-        labels[x == self.pad_id] = -100
+
+        # Only mask trailing padding we actually appended in _build_chunks
+        pad_len = 0
+        for i in reversed(range(len(chunk))):
+            if chunk[i] == self.pad_id:
+                pad_len += 1
+            else:
+                break
+        if pad_len > 0:
+            labels[-pad_len:] = -100
+
         return {
             "input_ids": x,
             "labels": labels,
