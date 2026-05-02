@@ -170,15 +170,12 @@ class Trainer:
         )
 
         # Scheduler steps count optimizer steps, not raw batches
-        steps_per_epoch = math.ceil(
-            len(self.train_loader) / self.grad_accum_steps
-        )
-        total_optimizer_steps = steps_per_epoch * cfg.epochs
-        self.scheduler = get_cosine_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=max(1, cfg.warmup_steps // self.grad_accum_steps),
-            num_training_steps=total_optimizer_steps,
-        )
+        # DEFERRED: avoid len() on lazy datasets to prevent eager chunking at init time.
+        # The scheduler is built on the first train_epoch() call when length is known.
+        self._scheduler_warmup = max(1, cfg.warmup_steps // self.grad_accum_steps)
+        self._scheduler_cycles = 0.5
+        self._scheduler_min_lr = 0.1
+        self.scheduler = None
 
         self.global_step = 0
         self.best_val_loss = float("inf")
@@ -230,6 +227,22 @@ class Trainer:
         tokens_seen = 0
 
         self.optimizer.zero_grad()
+
+        # Lazily initialize scheduler now that we know real loader length.
+        # This avoids forcing DocumentAwareDataset(lazy=True) to chunk all
+        # documents during Trainer construction.
+        if self.scheduler is None:
+            steps_per_epoch = math.ceil(
+                len(self.train_loader) / self.grad_accum_steps
+            )
+            total_optimizer_steps = steps_per_epoch * self.cfg.epochs
+            self.scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=self._scheduler_warmup,
+                num_training_steps=total_optimizer_steps,
+                num_cycles=self._scheduler_cycles,
+                min_lr_ratio=self._scheduler_min_lr,
+            )
 
         pbar = tqdm(
             self.train_loader,
