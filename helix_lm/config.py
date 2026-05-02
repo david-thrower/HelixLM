@@ -130,7 +130,7 @@ class HelixConfig(PretrainedConfig):
         fusion_strategy: str = "perceiver",  # "perceiver", "simple_merge"
 
         # memory
-        memory_efficient_forward: bool = False
+        memory_efficient_forward: bool = False,
         
         # --- Misc ---
         tie_word_embeddings: bool = True,
