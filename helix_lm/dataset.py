@@ -1,14 +1,16 @@
 """
 HelixLM Dataset with rolling text chunking and natural stop detection.
 
-Key features:
-  - Rolling window for text > MAX_SEQ_LEN: overlapping chunks with stride
-  - Padding for text < MAX_SEQ_LEN
-  - Distinguishes natural stop (end of document) from EOS token
-  - Supports both raw text and pre-tokenized inputs
-  - Compatible with HF datasets streaming interface
-  - Document-aware chunking: no cross-document boundaries, 100% token utilization
-  - Optional lazy loading: O(1) init, tokenize on-the-fly
+Key fixes in this revision
+  * DocumentAwareDataset now tracks exact pad_len in every chunk tuple.
+    It NEVER scans backwards for pad_token_id, so GPT-2 (pad_id == eos_id)
+    cannot accidentally mask a real EOS.
+  * Optional within-document overlap (stride) added to DocumentAwareDataset.
+    stride == seq_len  -> non-overlapping (default).
+    stride <  seq_len  -> overlapping windows; overlap is masked in labels.
+  * No cross-document boundaries are ever crossed.
+
+Compatible with both eager and lazy loading.
 """
 import random
 from typing import List, Optional, Iterator, Dict, Any, Union, Tuple
@@ -33,16 +35,6 @@ class HelixDataset(Dataset):
       - labels: (seq_len,) — shifted by 1 for next-token prediction
       - attention_mask: (seq_len,) — 1 for real tokens, 0 for padding
       - is_natural_stop: scalar bool — True if chunk ends at document boundary
-
-    Args:
-        texts: List of document texts.
-        tokenizer: Tokenizer instance.
-        seq_len: Target sequence length.
-        stride: Rolling window stride. Default: seq_len // 2.
-        lazy: If True, store raw texts and tokenize on-the-fly in __getitem__.
-              If False, eagerly tokenize all documents in __init__.
-        add_eos: Whether to append EOS token to each document.
-        natural_stop_threshold: Fraction of document length to consider as natural stop.
     """
     def __init__(
         self,
@@ -64,29 +56,25 @@ class HelixDataset(Dataset):
         self.natural_stop_threshold = natural_stop_threshold
 
         if lazy:
-            # O(1) init: just store texts
             self._tokenized_docs = None
             self._chunk_index = None
         else:
-            # Eager tokenization with progress bar
             self._tokenized_docs = self._tokenize_all()
             self._chunk_index = self._build_chunk_index()
 
     def _tokenize_all(self) -> List[Dict[str, Any]]:
-        """Pre-tokenize all documents, storing per-document token lists."""
         docs = []
         iterable = tqdm(self.texts, desc="Tokenizing", unit="doc", disable=len(self.texts) < 1000)
         for text in iterable:
             if not text.strip():
                 continue
             ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id'):
+            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
                 ids.append(self.tokenizer.eos_token_id)
             docs.append({"ids": ids, "length": len(ids)})
         return docs
 
     def _build_chunk_index(self) -> List[Tuple[int, int, bool]]:
-        """Build (doc_idx, start_idx, is_natural_stop) for every chunk."""
         index = []
         for doc_idx, doc in enumerate(self._tokenized_docs):
             length = doc["length"]
@@ -105,16 +93,13 @@ class HelixDataset(Dataset):
         return index
 
     def _build_lazy_chunk_index(self) -> List[Tuple[int, int, int, bool]]:
-        """Build chunk index from raw texts on-the-fly.
-        Returns (doc_idx, start_idx, effective_len, is_natural_stop).
-        """
         index = []
         for doc_idx, text in enumerate(self.texts):
             text = text.strip()
             if not text:
                 continue
             ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id'):
+            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
                 ids.append(self.tokenizer.eos_token_id)
             length = len(ids)
             if length == 0:
@@ -133,7 +118,6 @@ class HelixDataset(Dataset):
     def __len__(self) -> int:
         if self._chunk_index is not None:
             return len(self._chunk_index)
-        # Lazy mode: build index on first len() call and cache it
         if not hasattr(self, '_lazy_index') or self._lazy_index is None:
             self._lazy_index = self._build_lazy_chunk_index()
         return len(self._lazy_index)
@@ -149,7 +133,7 @@ class HelixDataset(Dataset):
             doc_idx, start_idx, length, is_natural_stop = self._lazy_index[idx]
             text = self.texts[doc_idx].strip()
             ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id'):
+            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
                 ids.append(self.tokenizer.eos_token_id)
 
         if length >= self.seq_len:
@@ -172,7 +156,6 @@ class HelixDataset(Dataset):
     def _make_sample(self, chunk, labels, is_natural_stop):
         input_ids = torch.tensor(chunk[:self.seq_len], dtype=torch.long)
         labels_t = torch.tensor(labels[:self.seq_len], dtype=torch.long)
-        # DO NOT blanket-mask pad_token_id here — pad_token_id may equal eos_token_id.
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         return {
             "input_ids": input_ids,
@@ -186,30 +169,46 @@ class DocumentAwareDataset(Dataset):
     """
     Per-document chunking with no cross-document boundaries.
 
-    For each document:
-      - Long documents: split into non-overlapping seq_len chunks.
-      - Short documents: kept as-is, padded to seq_len.
-      - Final chunk of each document is marked is_natural_stop=True.
-      - Only padding positions are masked in labels (-100).
-      - No label masking for overlap regions (100% token utilization).
+    Chunk tuple format (built in _build_chunks):
+        (token_ids, is_natural_stop, pad_len, overlap_mask_len)
 
-    Args:
-        texts: List of document texts.
-        tokenizer: Tokenizer with encode(), pad_token_id, eos_token_id.
-        seq_len: Target sequence length for all chunks.
-        min_tail_len: Minimum length for a tail chunk to be kept.
-                      Default: seq_len // 4.
-                      Set to 1 to keep all tails (e.g., for instruct data).
-        add_eos: Whether to append EOS token to each document.
-        lazy: If True, store raw texts and build chunks on-the-fly.
-              If False, eagerly tokenize all documents in __init__.
+      * pad_len: exact number of padded positions at the TAIL.
+                 Used to set labels[-pad_len:] = -100.
+                 Always 0 for full chunks.
+      * overlap_mask_len: number of positions at the HEAD to mask with -100.
+                 Used when stride < seq_len so overlapping tokens are not
+                 double-counted in loss. Always 0 when stride == seq_len.
+
+    For each document:
+      - Long documents: split into seq_len chunks (optionally overlapping).
+      - Short documents: kept as-is, padded to seq_len.
+      - Only padding positions are masked in labels (-100).
+      - No label masking for overlap regions except the explicit overlap head.
     """
-    def __init__(self, texts, tokenizer, seq_len, min_tail_len=None, add_eos=True, lazy=True):
+    def __init__(
+        self,
+        texts,
+        tokenizer,
+        seq_len,
+        min_tail_len=None,
+        add_eos=True,
+        lazy=True,
+        stride: Optional[int] = None,
+    ):
+        super().__init__()
         self.seq_len = seq_len
         self.tokenizer = tokenizer
-        self.pad_id = getattr(tokenizer, "pad_token_id", 0)
-        self.eos_id = getattr(tokenizer, "eos_token_id", self.pad_id)
+
+        # Robust pad_id fallback: if unset, fall back to eos_id, then 0.
+        self.pad_id = getattr(tokenizer, "pad_token_id", None)
+        if self.pad_id is None:
+            self.pad_id = getattr(tokenizer, "eos_token_id", 0)
+        self.eos_id = getattr(tokenizer, "eos_token_id", None)
+
         self.lazy = lazy
+        self.stride = stride if stride is not None else seq_len
+        if not (1 <= self.stride <= self.seq_len):
+            raise ValueError(f"stride must be in [1, seq_len], got {self.stride}")
 
         if min_tail_len is None:
             min_tail_len = seq_len // 4
@@ -225,14 +224,15 @@ class DocumentAwareDataset(Dataset):
             self.chunks, self._stats = self._build_chunks(texts)
 
     def _build_chunks(self, texts):
-        """Eagerly build chunks from texts. Returns (chunks, stats)."""
+        """
+        Build chunk tuples:
+          (token_ids: List[int], is_natural: bool, pad_len: int, overlap_mask: int)
+        """
         chunks = []
-        dropped_short = 0
-        dropped_tail = 0
-        kept = 0
+        dropped_short = dropped_tail = kept = 0
+        stride = self.stride
 
-        iterable = tqdm(texts, desc="Chunking", unit="doc", disable=len(texts) < 1000)
-        for text in iterable:
+        for text in tqdm(texts, desc="Chunking", unit="doc", disable=len(texts) < 1000):
             text = text.strip()
             if not text:
                 continue
@@ -245,24 +245,55 @@ class DocumentAwareDataset(Dataset):
             if self.add_eos and self.eos_id is not None:
                 ids.append(self.eos_id)
 
-            n_full = len(ids) // self.seq_len
-            remainder_len = len(ids) % self.seq_len
+            length = len(ids)
 
-            for i in range(n_full):
-                start = i * self.seq_len
-                chunk = ids[start:start + self.seq_len]
-                is_last_chunk = (i == n_full - 1)
-                no_tail_kept = (remainder_len < self.min_tail_len)
-                chunks.append((chunk, is_last_chunk and no_tail_kept))
-                kept += 1
+            if length >= self.seq_len:
+                # Sliding-window chunks fully inside the document
+                starts = list(range(0, length - self.seq_len + 1, stride))
+                for i, start in enumerate(starts):
+                    chunk = ids[start:start + self.seq_len]
+                    is_last_start = (i == len(starts) - 1)
+                    reaches_end = (start + self.seq_len == length)
 
-            if remainder_len >= self.min_tail_len:
-                tail = ids[n_full * self.seq_len:]
-                tail = tail + [self.pad_id] * (self.seq_len - remainder_len)
-                chunks.append((tail, True))
+                    # Natural stop logic: if this is the last chunk we will emit
+                    # and there is no tail (or tail is too short), mark it.
+                    if not is_last_start:
+                        is_natural = False
+                    else:
+                        tail_len = length - (start + self.seq_len)
+                        has_tail = tail_len >= self.min_tail_len
+                        is_natural = reaches_end or (not has_tail)
+
+                    overlap_mask = 0
+                    if start > 0 and stride < self.seq_len:
+                        overlap_mask = self.seq_len - stride
+
+                    chunks.append((chunk, is_natural, 0, overlap_mask))
+                    kept += 1
+
+                # Tail: tokens after the last sliding chunk
+                last_covered_end = starts[-1] + self.seq_len if starts else 0
+                remainder_len = length - last_covered_end
+
+                if remainder_len >= self.min_tail_len:
+                    tail = ids[last_covered_end:]
+                    pad_len = self.seq_len - remainder_len
+                    tail = tail + [self.pad_id] * pad_len
+                    chunks.append((tail, True, pad_len, 0))
+                    kept += 1
+                elif remainder_len > 0:
+                    # Tail too short to keep: last sliding chunk becomes the doc end
+                    if starts:
+                        last_chunk, _, last_pad, last_overlap = chunks[-1]
+                        chunks[-1] = (last_chunk, True, last_pad, last_overlap)
+                    dropped_tail += 1
+
+            else:
+                # Short document: pad once, everything is a natural stop
+                pad_len = self.seq_len - length
+                chunk = ids + [self.pad_id] * pad_len
+                chunks.append((chunk, True, pad_len, 0))
                 kept += 1
-            elif remainder_len > 0:
-                dropped_tail += 1
 
         stats = {
             "kept": kept,
@@ -272,7 +303,6 @@ class DocumentAwareDataset(Dataset):
         return chunks, stats
 
     def _ensure_chunks(self):
-        """Lazy build chunks on first access."""
         if self.chunks is None:
             self.chunks, self._stats = self._build_chunks(self.texts)
             self.texts = None  # free memory
@@ -283,17 +313,16 @@ class DocumentAwareDataset(Dataset):
 
     def __getitem__(self, idx):
         self._ensure_chunks()
-        chunk, is_natural = self.chunks[idx]
+        chunk, is_natural, pad_len, overlap_mask = self.chunks[idx]
+
         x = torch.tensor(chunk, dtype=torch.long)
         labels = x.clone()
 
-        # Only mask trailing padding we actually appended in _build_chunks
-        pad_len = 0
-        for i in reversed(range(len(chunk))):
-            if chunk[i] == self.pad_id:
-                pad_len += 1
-            else:
-                break
+        # 1. Mask overlapping head (only when stride < seq_len)
+        if overlap_mask > 0:
+            labels[:overlap_mask] = -100
+
+        # 2. Mask exact trailing padding count (robust to pad_id == eos_id)
         if pad_len > 0:
             labels[-pad_len:] = -100
 
@@ -327,7 +356,6 @@ class HelixDatasetFromTokens(Dataset):
         self.seq_len = seq_len
         self.stride = stride or max(1, seq_len // 2)
 
-        # Pre-compute indices for all valid chunks
         n = len(self.tokens)
         self.indices = list(range(0, max(1, n - seq_len), self.stride))
         if n >= seq_len and (n - seq_len) % self.stride != 0:
@@ -352,20 +380,7 @@ class HelixDatasetFromTokens(Dataset):
 class HelixHFDataset(Dataset):
     """
     Wrapper for HuggingFace datasets with streaming and non-streaming support.
-    Handles text > seq_len via rolling chunking. Works with both Dataset
-    and IterableDataset sources.
-
-    Args:
-        hf_dataset: A HuggingFace datasets.Dataset or IterableDataset,
-                    or a dataset name string.
-        tokenizer: Tokenizer instance.
-        seq_len: Target sequence length.
-        text_column: Column name containing text.
-        stride: Rolling window stride.
-        max_samples: Maximum number of samples to use. For streaming datasets,
-                     uses .take(); for map datasets, uses .select().
-        lazy: Whether to build chunks lazily.
-        **kwargs: Additional arguments passed to load_dataset if hf_dataset is a string.
+    Uses DocumentAwareDataset internally, so no cross-document boundaries.
     """
     def __init__(
         self,
@@ -381,7 +396,6 @@ class HelixHFDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.seq_len = seq_len
-        self.stride = stride or max(1, seq_len // 2)
         self.text_column = text_column
         self.lazy = lazy
         self.max_samples = max_samples
@@ -389,7 +403,6 @@ class HelixHFDataset(Dataset):
         if isinstance(hf_dataset, str):
             from datasets import load_dataset
             dataset_name = hf_dataset
-            # Only pass trust_remote_code for known script-based datasets
             known_script_datasets = {"openai_humaneval", "bigcode/the-stack", "bigcode/the-stack-v2"}
             load_kwargs = dict(kwargs)
             if dataset_name not in known_script_datasets:
@@ -398,27 +411,21 @@ class HelixHFDataset(Dataset):
         else:
             self.dataset = hf_dataset
 
-        # Handle DatasetDict: use "train" split by default
         if hasattr(self.dataset, "keys") and hasattr(self.dataset, "__getitem__"):
             if "train" in self.dataset:
                 self.dataset = self.dataset["train"]
             else:
-                # Pick first available split
                 self.dataset = self.dataset[list(self.dataset.keys())[0]]
 
-        # Apply max_samples
         if max_samples is not None:
             if hasattr(self.dataset, "take") and hasattr(self.dataset, "__iter__"):
-                # IterableDataset
                 self.dataset = self.dataset.take(max_samples)
             elif hasattr(self.dataset, "select"):
-                # Map Dataset
                 indices = list(range(min(max_samples, len(self.dataset))))
                 self.dataset = self.dataset.select(indices)
 
         # Extract texts
         if hasattr(self.dataset, "__iter__") and not hasattr(self.dataset, "__getitem__"):
-            # IterableDataset: consume to list (streaming)
             self._texts = []
             iterable = tqdm(self.dataset, desc="Loading HF dataset", unit="sample",
                             total=max_samples, disable=max_samples is not None and max_samples < 1000)
@@ -430,7 +437,6 @@ class HelixHFDataset(Dataset):
                     break
             self._dataset_type = "list"
         else:
-            # Map Dataset or list
             if hasattr(self.dataset, "__getitem__") and hasattr(self.dataset, "__len__"):
                 iterable = tqdm(range(len(self.dataset)), desc="Loading HF dataset", unit="sample",
                                 disable=len(self.dataset) < 1000)
@@ -441,10 +447,9 @@ class HelixHFDataset(Dataset):
                 self._texts = list(self.dataset)
                 self._dataset_type = "list"
 
-        # Wrap with DocumentAwareDataset for chunking
         self._doc_dataset = DocumentAwareDataset(
             self._texts, tokenizer, seq_len,
-            min_tail_len=seq_len // 4, add_eos=True, lazy=lazy,
+            min_tail_len=seq_len // 4, add_eos=True, lazy=lazy, stride=stride,
         )
 
     def __len__(self) -> int:
@@ -469,9 +474,6 @@ def create_helix_dataloader(
     lazy: bool = True,
     **kwargs,
 ) -> torch.utils.data.DataLoader:
-    """
-    Create a DataLoader from text list with rolling chunking.
-    """
     dataset = HelixDataset(texts, tokenizer, seq_len, stride, lazy=lazy, **kwargs)
 
     def collate_fn(batch):
@@ -507,29 +509,19 @@ def create_document_loader(
     min_tail_len: Optional[int] = None,
     add_eos: bool = True,
     lazy: bool = True,
+    stride: Optional[int] = None,
 ) -> DataLoader:
     """
     Create a DataLoader using DocumentAwareDataset (no boundary crossings).
 
     Args:
-        texts: List of document texts.
-        tokenizer: Tokenizer instance.
-        seq_len: Sequence length for chunks.
-        batch_size: Batch size.
-        shuffle: Whether to shuffle chunks.
-        drop_last: Whether to drop last incomplete batch.
-        num_workers: DataLoader workers.
-        min_tail_len: Minimum tail length to keep. Default seq_len//4.
-        add_eos: Whether to append EOS to documents.
-        lazy: If True, tokenize on-the-fly. If False, eagerly tokenize.
-
-    Returns:
-        DataLoader yielding batches with input_ids, labels, attention_mask,
-        and is_natural_stop tensors.
+        stride: If < seq_len, enables within-document overlap (default: seq_len).
+                This restores more optimizer steps per epoch without ever
+                crossing document boundaries.
     """
     ds = DocumentAwareDataset(
         texts, tokenizer, seq_len,
-        min_tail_len=min_tail_len, add_eos=add_eos, lazy=lazy,
+        min_tail_len=min_tail_len, add_eos=add_eos, lazy=lazy, stride=stride,
     )
 
     def collate_fn(batch):
@@ -552,3 +544,4 @@ def create_document_loader(
         num_workers=num_workers,
         drop_last=drop_last,
     )
+  
