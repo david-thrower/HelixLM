@@ -37,11 +37,16 @@ class HelixLMCore(nn.Module):
         # RoPE frequencies
         self.register_buffer("freqs_cis", None, persistent=False)
         if cfg.use_rope:
+            # Defensive: cfg.dtype may be mutated to a string after save_pretrained
+            dtype = cfg.dtype
+            if isinstance(dtype, str):
+                dtype = getattr(torch, dtype.replace("torch.", ""))
+
             freqs = precompute_freqs_cis(
                 cfg.head_dim,
                 cfg.seq_len * 4,
                 cfg.rope_theta,
-                dtype=cfg.dtype,
+                dtype=dtype,
             )
             self.register_buffer("freqs_cis", freqs, persistent=False)
 
