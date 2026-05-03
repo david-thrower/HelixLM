@@ -48,3 +48,7 @@ jobs:
       timeout-minutes: 60
       run: |
         python3 quick_demo_cpu_titans_mem.py
+    - name: Smoke Test Training with Datasets
+      timeout-minutes: 90
+      run: |
+        python3 train-with-dataset-cicd-test.py
