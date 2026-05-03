@@ -17,19 +17,22 @@ from .nodes import RMSNorm
 class HelixLMCore(nn.Module):
     """
     Core HelixLM model (non-HF wrapper).
-    
+
     Used internally; for HF compatibility see hf_model.py HelixForCausalLM.
     """
-    def __init__(self, cfg: HelixConfig, tie_weights: bool = True):
+    def __init__(self, cfg: HelixConfig, tie_weights: bool = True, create_output_head: bool = True):
         super().__init__()
         self.cfg = cfg
 
         self.embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.recurrent = HelixRecurrentBlock(cfg)
         self.out_norm = RMSNorm(cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if tie_weights:
-            self.head.weight = self.embed.weight  # weight tying
+
+        self.head = None
+        if create_output_head:
+            self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+            if tie_weights:
+                self.head.weight = self.embed.weight  # weight tying
 
         # RoPE frequencies
         self.register_buffer("freqs_cis", None, persistent=False)
@@ -55,7 +58,15 @@ class HelixLMCore(nn.Module):
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         e = self.embed(token_ids)
         h = self.recurrent(e, e.detach())
-        logits = self.head(self.out_norm(h))
+        if self.head is not None:
+            logits = self.head(self.out_norm(h))
+        else:
+            raise RuntimeError(
+                "HelixLMCore was created with create_output_head=False, "
+                "but forward() was called without an output head. "
+                "Either create the core with create_output_head=True (default), "
+                "or ensure the caller provides its own output projection."
+            )
         return logits
 
     @torch.no_grad()
