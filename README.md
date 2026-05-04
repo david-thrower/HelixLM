@@ -150,17 +150,18 @@ Recurrent loops reuse weights (depth without parameter growth). Graph wiring cre
 
 Because the graph is the bulk of the model, parameter counts are shown for **two common vocabularies**: a minimal character-level vocab (~100 tokens) and the GPT-2 BPE vocab (50,257 tokens). Both assume **tied embeddings/head**.
 
-| Preset | d_model | Columns | Heads | Loops | SSM | **~Params (Char)** | **~Params (GPT-2)** | Seq Len | Use Case |
-|--------|---------|---------|-------|-------|-----|-------------------|---------------------|---------|----------|
-| `tiny` | 128 | 2 | 4 | 1 | No | **496,006** | **20M** | 256 | Smoke test |
-| `small` | 256 | 3 | 4 | 2 | No | **-** | **-** | 512 | Experiments |
-| `base` | 512 | 4 | 8 | 2 | Yes | **-** | **-** | 1024 | Serious pretraining |
-| `medium` | 768 | 5 | 12 | 3 | Yes | **-** | **-** | 2048 | Production small |
-| `large` | 1024 | 6 | 16 | 3 | Yes | **-** | **-** | 4096 | Competitive |
-| `xl` | 1536 | 6 | 24 | 4 | Yes | **-** | **-** | 8192 | Frontier small |
-| `xxl` | 2048 | 7 | 32 | 4 | Yes | **-** | **-** | 16384 | Near-frontier |
+## Parameter Scaling
 
-> **How to read the table:** At small scale the GPT-2 embedding dominates the parameter budget. At `xxl`, the heterogeneous graph dominates (~1.24B) and the vocabulary adds only ~8%. If you train on a custom tiny vocabulary, you can cut millions to billions of parameters from the embedding layer.
+| Preset | d_model | ~Params (Char) | ~Params (GPT-2) | Status |
+|--------|---------|---------------|-----------------|--------|
+| **tiny** | 128 | 0.5 M | **13 M** | Smoke tests + demos |
+| **small** | 256 | 3.2 M | 29 M | Experiments |
+| **base** | 512 | 32 M | 83 M | Serious pretraining |
+| **medium** | 768 | ~134 M | ~211 M | Production small |
+| **large** | 1 024 | ~286 M | ~389 M | Competitive |
+| **xl** | 1 536 | ~1.1 B | ~1.2 B | Frontier small |
+| **xxl** | 2 048 | ~2.7 B | ~2.9 B | Frontier |
+
 
 ```python
 # One-liner scaling

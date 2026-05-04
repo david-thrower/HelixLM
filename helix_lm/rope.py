@@ -7,13 +7,26 @@ import torch
 import torch.nn as nn
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def precompute_freqs_cis(
+    dim: int,
+    end: int,
+    theta: float = 10000.0,
+    dtype=None,
+) -> torch.Tensor:
     """Precompute RoPE frequency tensor [cos, sin] pairs."""
+    # Defensive: accept string, torch.dtype, or None
+    if dtype is None:
+        torch_dtype = torch.float32
+    elif isinstance(dtype, str):
+        torch_dtype = getattr(torch, dtype.replace("torch.", ""))
+    else:
+        torch_dtype = dtype
+
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
     t = torch.arange(end, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    cos = torch.cos(freqs).to(dtype)
-    sin = torch.sin(freqs).to(dtype)
+    cos = torch.cos(freqs).to(torch_dtype)
+    sin = torch.sin(freqs).to(torch_dtype)
     return torch.stack([cos, sin], dim=-1)
 
 

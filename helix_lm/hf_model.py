@@ -127,7 +127,9 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
     def __init__(self, config: HelixConfig):
         super().__init__(config)
         self.config = config
-        self.model = HelixLMCore(config, tie_weights=False)
+        # FIX: Pass create_output_head=False to avoid dead-weight duplicate head.
+        # HelixForCausalLM owns the sole lm_head used in forward().
+        self.model = HelixLMCore(config, tie_weights=False, create_output_head=False)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
 
         # Initialize weights
@@ -285,7 +287,7 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
             # Top-k
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float('-inf')
+                logits[logits < v[:, [-1]]] = float("-inf")
 
             # Top-p
             if top_p is not None:
@@ -295,7 +297,7 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = False
                 indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
-                logits[indices_to_remove] = float('-inf')
+                logits[indices_to_remove] = float("-inf")
 
             # Sample
             probs = F.softmax(logits, dim=-1)

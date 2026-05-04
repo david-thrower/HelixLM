@@ -201,7 +201,10 @@ class HelixConfig(PretrainedConfig):
         self.grad_clip = grad_clip
         self.initializer_range = initializer_range
         self.device = device
-        self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+        if isinstance(dtype, str):
+            self.dtype = getattr(torch, dtype.replace("torch.", ""))
+        else:
+            self.dtype = dtype
 
         # --- Tokenizer ---
         self.tokenizer_name = tokenizer_name
@@ -272,7 +275,7 @@ class HelixConfig(PretrainedConfig):
 
     def to_dict(self) -> Dict[str, Any]:
         d = super().to_dict()
-        d["dtype"] = str(self.dtype)
+        d["dtype"] = str(self.dtype).replace("torch.", "")
         return d
 
     @classmethod
