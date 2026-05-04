@@ -61,7 +61,7 @@ class HelixConfig(PretrainedConfig):
         ssm_bias: bool = False,
 
         # --- Titans Neural Memory ---
-        use_titans_memory: bool = False,
+        use_titans_memory: bool = True,
         titans_feature_dim: int = 64,
         titans_eta_init: float = 0.01,
         titans_n_heads: int = 4,
@@ -129,6 +129,9 @@ class HelixConfig(PretrainedConfig):
         vision_num_attention_heads: int = 16,
         fusion_strategy: str = "perceiver",  # "perceiver", "simple_merge"
 
+        # memory
+        memory_efficient_forward: bool = False,
+        
         # --- Misc ---
         tie_word_embeddings: bool = True,
         **kwargs,
@@ -225,6 +228,9 @@ class HelixConfig(PretrainedConfig):
         self.vision_intermediate_size = vision_intermediate_size
         self.vision_num_attention_heads = vision_num_attention_heads
         self.fusion_strategy = fusion_strategy
+
+        # memory
+        self.memory_efficient_forward = memory_efficient_forward
 
         # --- Validation ---
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"

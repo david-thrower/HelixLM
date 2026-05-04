@@ -4,7 +4,7 @@ Example: Training HelixLM with HuggingFace integration.
 Demonstrates:
   - GPT-2 tokenizer
   - HelixForCausalLM HF model
-  - Streaming dataset
+  - Document-aware dataset with lazy loading
   - save_pretrained / push_to_hub
 """
 import os
@@ -21,6 +21,7 @@ def main():
         vocab_size=50257,
         seq_len=256,
         tokenizer_name="gpt2",
+        use_titans_memory=False,
     )
 
     # Tokenizer
@@ -60,7 +61,7 @@ def main():
     # Generate
     print("\n--- Generation ---")
     prompt = "In 1492,"
-    input_ids = torch.tensor([tokenizer.encode(prompt)]).to(model.device)
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
     generated = model.generate_ext(input_ids, max_new_tokens=20, temperature=0.8)
     text = tokenizer.decode(generated[0], skip_special_tokens=True)
     print(f"  '{prompt}' -> '{text}'")

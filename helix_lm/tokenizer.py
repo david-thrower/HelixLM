@@ -237,3 +237,10 @@ class HelixTokenizer:
         if return_dict:
             return result
         return result["input_ids"]
+
+    def save_pretrained(self, path):
+        return self._backend.save_pretrained(path)
+
+    def push_to_hub(self, repo_id, **kwargs):
+        return self._backend.push_to_hub(repo_id, **kwargs)
+
