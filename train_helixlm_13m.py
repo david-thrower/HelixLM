@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """
-train_helixlm_13m.py
+train_helixlm_13m_resume.py
 
-Production rewrite with three critical fixes:
-  1. torch.compile()  -> fuses Python loops in Mamba2/Titans
-  2. Shard streaming  -> caps host RAM to ~2-4 GB per shard
-  3. Epoch checkpoint -> full resume (model + optimizer + scheduler + RNG)
-
-Stages:
-  1A: 3 epochs @ 3e-3  (high-LR descent)
-  1B: 5 epochs @ 3e-4  (grokking)
-  2:  2 epochs @ 3e-4  (instruction tuning)
+Proven A100 training with epoch-level resume.
+- NO torch.compile (harmful for this architecture)
+- NO sharded streaming (unnecessary on A100 142GB RAM)
+- Uses existing Trainer class directly
+- Saves full state (model + optimizer + scheduler + RNG) every epoch
 """
-
 import argparse
 import gc
 import glob
@@ -25,25 +20,37 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 
 import torch
-import torch.nn as nn
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-
-# ---------------------------------------------------------------------------
-# HelixLM imports
-# ---------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HELIXLM_PATH = os.environ.get("HELIXLM_PATH", os.path.join(SCRIPT_DIR, "..", "HelixLM"))
 if HELIXLM_PATH not in sys.path:
     sys.path.insert(0, HELIXLM_PATH)
 
-from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer
-from helix_lm.dataset import DocumentAwareDataset
+from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, Trainer
 
 
 DATASET_REPO = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
+
+PRESETS = {
+    256: {
+        "batch_size": 24,
+        "grad_accum": 4,
+        "seq_len": 256,
+        "epochs_stage1a": 3,
+        "epochs_stage1b": 5,
+        "epochs_stage2": 2,
+        "lr_stage1": 3.0e-3,
+        "lr_grok": 3.0e-4,
+        "lr_stage2": 3.0e-4,
+        "warmup_steps": 2000,
+        "weight_decay": 0.05,
+        "grad_clip": 1.0,
+        "eval_every": 1,
+        "generated_example_length": 50,
+    },
+}
 
 PRETRAIN_PROMPTS = [
     "After seeing something unexpected, Peter shouted",
@@ -57,19 +64,15 @@ INSTRUCT_PROMPTS = [
     "<|user|>\nWhat is the derivative of x^2?\n<|assistant|>\n",
     "<|user|>\nExplain quantum computing in simple terms.\n<|assistant|>\n",
     "<|user|>\nWrite a Python function to calculate fibonacci numbers.\n<|assistant|>\n",
+    "<|user|>\nHow does photosynthesis work?\n<|assistant|>\n",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Scheduler (inline to avoid import fragility)
+# Scheduler fallback (in case helix_lm.trainer export is flaky)
 # ---------------------------------------------------------------------------
-def get_cosine_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    num_cycles: float = 0.5,
-    min_lr_ratio: float = 0.1,
-):
+def _get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps,
+                                     num_cycles=0.5, min_lr_ratio=0.1):
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -78,13 +81,24 @@ def get_cosine_schedule_with_warmup(
         )
         cosine = 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * max(0.0, cosine)
-
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ---------------------------------------------------------------------------
-# GPU / preset helpers
+# Dataset loading (same as original working script)
 # ---------------------------------------------------------------------------
+def load_texts(repo_id: str, split_name: str, max_samples: Optional[int] = None) -> List[str]:
+    print(f"  Streaming '{split_name}' ...")
+    ds = load_dataset(repo_id, split=split_name, streaming=True)
+    texts = []
+    for i, item in enumerate(tqdm(ds, desc=f"  {split_name}", unit="smpl", leave=False)):
+        if max_samples and i >= max_samples:
+            break
+        texts.append(item["text"])
+    print(f"    -> {len(texts):,} samples")
+    return texts
+
+
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         dev = torch.device("cuda")
@@ -95,316 +109,204 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def detect_gpu_preset(seq_len: int):
-    if not torch.cuda.is_available():
-        return {"batch_size": 8, "grad_accum": 4, "shard_size": 5000, "label": "CPU"}
-    name = torch.cuda.get_device_properties(0).name.lower()
-    if "a100" in name:
-        # 80 GB HBM2e — massive headroom for a 14 M model
-        return {"batch_size": 64, "grad_accum": 2, "shard_size": 50000, "label": "A100"}
-    if "l4" in name:
-        # 24 GB
-        return {"batch_size": 24, "grad_accum": 4, "shard_size": 50000, "label": "L4"}
-    # Generic GPU fallback
-    return {"batch_size": 16, "grad_accum": 4, "shard_size": 25000, "label": "GPU"}
+def print_model_report(cfg, model, preset, phase="INIT"):
+    params = model.count_parameters()
+    try:
+        graph = model.model.recurrent.graph.get_graph_info()
+    except Exception:
+        graph = {"n_nodes": "N/A", "n_edges": "N/A", "node_types": {}, "sinks": []}
 
-
-# ---------------------------------------------------------------------------
-# Shard streaming
-# ---------------------------------------------------------------------------
-def shard_iterator(
-    repo_id: str,
-    split: str,
-    shard_size: int,
-    max_samples: Optional[int] = None,
-):
-    """Yield lists of `shard_size` texts from a streaming HF dataset."""
-    print(f"  Streaming '{split}' in shards of {shard_size} ...")
-    ds = load_dataset(repo_id, split=split, streaming=True)
-    buffer: List[str] = []
-    count = 0
-    for item in ds:
-        text = item.get("text", "")
-        if text:
-            buffer.append(text)
-            count += 1
-        if len(buffer) >= shard_size:
-            yield buffer
-            buffer = []
-            gc.collect()
-        if max_samples and count >= max_samples:
-            break
-    if buffer:
-        yield buffer
-
-
-# ---------------------------------------------------------------------------
-# DataLoader builder
-# ---------------------------------------------------------------------------
-def build_loader(
-    texts: List[str],
-    tokenizer,
-    seq_len: int,
-    batch_size: int,
-    shuffle: bool = True,
-    drop_last: bool = True,
-):
-    ds = DocumentAwareDataset(
-        texts, tokenizer, seq_len, min_tail_len=1, lazy=True
-    )
-
-    def collate_fn(batch):
-        return {
-            "input_ids": torch.stack([b["input_ids"] for b in batch]),
-            "labels": torch.stack([b["labels"] for b in batch]),
-            "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
-        }
-
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        collate_fn=collate_fn,
-        drop_last=drop_last,
-        num_workers=0,  # safer in container jobs
-    )
+    print(f"\n{'='*70}")
+    print(f"  HELIXLM MODEL REPORT  [{phase}]")
+    print(f"{'='*70}")
+    print(f"  Total params      : {params['total']:,}  (~{params['total']/1e6:.1f}M)")
+    print(f"  d_model           : {cfg.d_model}")
+    print(f"  n_columns         : {cfg.n_columns}")
+    print(f"  n_loops           : {cfg.n_loops}")
+    print(f"  seq_len           : {cfg.seq_len}")
+    print(f"  batch_size        : {cfg.batch_size}")
+    print(f"  grad_accum        : {preset['grad_accum']}")
+    print(f"  Effective batch   : {cfg.batch_size * preset['grad_accum']} samples")
+    print(f"  attention_mode    : {cfg.attention_mode}")
+    print(f"  use_titans        : {cfg.use_titans_memory}")
+    print(f"  use_ssm           : {cfg.use_ssm}")
+    print(f"  Graph nodes       : {graph.get('n_nodes', 'N/A')}")
+    print(f"  Graph edges       : {graph.get('n_edges', 'N/A')}")
+    print(f"{'='*70}\n")
 
 
 # ---------------------------------------------------------------------------
 # Resume helpers
 # ---------------------------------------------------------------------------
-def save_resume(
-    output_dir: str,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    global_step: int,
-    stage: str,
-):
-    ckpt = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict() if scheduler else None,
+def _find_latest_resume_dir(output_dir: str, stage_name: str) -> Optional[str]:
+    pattern = os.path.join(output_dir, stage_name, "resume_epoch_*")
+    dirs = sorted(glob.glob(pattern))
+    if not dirs:
+        return None
+    latest = dirs[-1]
+    if os.path.exists(os.path.join(latest, "trainer_state.pt")):
+        return latest
+    return None
+
+
+def _find_global_resume(output_dir: str) -> Optional[str]:
+    for stage in ["stage2", "stage1b", "stage1a"]:
+        d = _find_latest_resume_dir(output_dir, stage)
+        if d:
+            return d
+    return None
+
+
+def _save_resume_checkpoint(trainer: Trainer, model: torch.nn.Module, epoch: int,
+                            stage_name: str, output_dir: str, tokenizer):
+    ckpt_dir = os.path.join(output_dir, stage_name, f"resume_epoch_{epoch:03d}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    state = {
         "epoch": epoch,
-        "global_step": global_step,
-        "stage": stage,
+        "stage": stage_name,
+        "model_state_dict": model.state_dict(),
+        "optimizer": trainer.optimizer.state_dict(),
+        "scheduler": trainer.scheduler.state_dict() if trainer.scheduler else None,
+        "global_step": trainer.global_step,
+        "best_val_loss": trainer.best_val_loss,
+        "history": trainer.history,
         "rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
-    path = os.path.join(output_dir, f"resume_{stage}_epoch_{epoch:03d}.pt")
-    torch.save(ckpt, path)
-    print(f"  [CKPT] Resume state saved: {path}")
-    return path
+    torch.save(state, os.path.join(ckpt_dir, "trainer_state.pt"))
+    model.save_pretrained(ckpt_dir)
+    tokenizer._backend.save_pretrained(ckpt_dir)
+    print(f"  [CKPT] Resume saved: {ckpt_dir}")
 
 
-def try_resume(
-    output_dir: str,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    stage: str,
-):
-    """Return (start_epoch, global_step). If nothing found, returns (1, 0)."""
-    pattern = os.path.join(output_dir, f"resume_{stage}_epoch_*.pt")
-    files = sorted(glob.glob(pattern))
-    if not files:
-        return 1, 0
-    latest = files[-1]
-    print(f"  [RESUME] Loading state from {latest}")
-    ckpt = torch.load(latest, map_location="cpu")
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    if ckpt.get("rng") is not None:
-        torch.set_rng_state(ckpt["rng"])
-    if ckpt.get("cuda_rng") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
-    start_epoch = ckpt["epoch"] + 1
-    global_step = ckpt.get("global_step", 0)
-    print(f"  [RESUME] Stage {stage} resuming at epoch {start_epoch} (step {global_step})")
-    return start_epoch, global_step
+def _resume_stage(trainer: Trainer, model: torch.nn.Module, stage_name: str,
+                  output_dir: str, num_epochs: int) -> int:
+    """Rebuild scheduler and load state. Returns next epoch to run (1 if fresh)."""
+    ckpt_dir = _find_latest_resume_dir(output_dir, stage_name)
+    if not ckpt_dir:
+        return 1
 
+    print(f"  [RESUME] Found checkpoint: {ckpt_dir}")
+    state = torch.load(os.path.join(ckpt_dir, "trainer_state.pt"), map_location="cpu")
 
-def fast_forward_scheduler(scheduler, steps: int):
-    """Step scheduler `steps` times to restore LR position after resume."""
-    for _ in range(steps):
-        scheduler.step()
+    # Load model
+    model.load_state_dict(state["model_state_dict"])
 
+    # Rebuild scheduler BEFORE loading (train_epoch skips init if scheduler exists)
+    steps_per_epoch = math.ceil(len(trainer.train_loader) / trainer.grad_accum_steps)
+    total_steps = steps_per_epoch * num_epochs
+    warmup = max(1, trainer.cfg.warmup_steps // trainer.grad_accum_steps)
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def eval_model(model, loader: DataLoader, device: torch.device):
-    model.eval()
-    total_loss = 0.0
-    num_batches = 0
-    for batch in tqdm(loader, desc="Val", leave=False):
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        outputs = model(input_ids, labels=labels)
-        loss = outputs["loss"]
-        if not (torch.isnan(loss) or torch.isinf(loss)):
-            total_loss += loss.item()
-            num_batches += 1
-    return total_loss / max(num_batches, 1)
-
-
-# ---------------------------------------------------------------------------
-# Core shard-aware training stage
-# ---------------------------------------------------------------------------
-def train_stage(
-    model: HelixForCausalLM,
-    cfg: HelixConfig,
-    tokenizer,
-    device: torch.device,
-    stage_name: str,
-    lr: float,
-    epochs: int,
-    train_split: str,
-    val_split: str,
-    shard_size: int,
-    batch_size: int,
-    grad_accum: int,
-    output_dir: str,
-    example_prompts: List[str],
-    max_samples: Optional[int] = None,
-):
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=cfg.weight_decay,
-        betas=(0.9, 0.999),
-    )
-
-    # Scheduler: estimate total steps for the stage
-    # (over-estimate is safe; under-estimate just means LR stays higher longer)
-    if max_samples:
-        est_steps_per_epoch = math.ceil(
-            (max_samples * 1.5) / (batch_size * grad_accum)
+    try:
+        from helix_lm.trainer import get_cosine_schedule_with_warmup
+        trainer.scheduler = get_cosine_schedule_with_warmup(
+            trainer.optimizer, warmup, total_steps
         )
-    else:
-        # ~730 k samples in full dataset; 1.5x fudge for chunking overlap
-        est_steps_per_epoch = math.ceil((730_000 * 1.5) / (batch_size * grad_accum))
-    total_est_steps = est_steps_per_epoch * epochs
-    warmup_steps = max(1, cfg.warmup_steps // grad_accum)
+    except Exception:
+        trainer.scheduler = _get_cosine_schedule_with_warmup(
+            trainer.optimizer, warmup, total_steps
+        )
 
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_est_steps,
-        min_lr_ratio=0.1,
+    # Load trainer state
+    trainer.optimizer.load_state_dict(state["optimizer"])
+    if state.get("scheduler") and trainer.scheduler:
+        trainer.scheduler.load_state_dict(state["scheduler"])
+    trainer.global_step = state.get("global_step", 0)
+    trainer.best_val_loss = state.get("best_val_loss", float("inf"))
+    if state.get("history"):
+        trainer.history = state["history"]
+
+    # RNG
+    if state.get("rng") is not None:
+        torch.set_rng_state(state["rng"])
+    if state.get("cuda_rng") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["cuda_rng"])
+
+    start_epoch = state["epoch"] + 1
+    print(f"  [RESUME] Starting {stage_name} at epoch {start_epoch}/{num_epochs}")
+    return start_epoch
+
+
+def _stage_is_complete(output_dir: str, stage_name: str, num_epochs: int) -> bool:
+    d = _find_latest_resume_dir(output_dir, stage_name)
+    if not d:
+        return False
+    state = torch.load(os.path.join(d, "trainer_state.pt"), map_location="cpu")
+    return state["epoch"] >= num_epochs
+
+
+# ---------------------------------------------------------------------------
+# Stage runner (wraps Trainer, calls train_epoch directly for resume control)
+# ---------------------------------------------------------------------------
+def run_stage(model, cfg, tokenizer, device, stage_name, lr, num_epochs,
+              train_texts, val_texts, output_dir, preset, example_prompts,
+              push_to_hub=False, hf_org=None, hf_token=None, timestamp=None):
+    os.makedirs(os.path.join(output_dir, stage_name), exist_ok=True)
+
+    cfg.lr = lr
+    cfg.epochs = num_epochs
+
+    trainer = Trainer(
+        model=model,
+        cfg=cfg,
+        train_texts=train_texts,
+        val_texts=val_texts,
+        tokenizer=tokenizer,
+        output_dir=os.path.join(output_dir, stage_name),
+        example_prompts=example_prompts,
+        generated_example_length=preset["generated_example_length"],
+        grad_accum_steps=preset["grad_accum"],
+        use_amp=False,
+        min_tail_len=1,
     )
 
-    # Resume
-    start_epoch, global_step = try_resume(output_dir, model, optimizer, stage_name)
-    if global_step > 0:
-        fast_forward_scheduler(scheduler, global_step)
+    # Resume or start fresh
+    start_epoch = _resume_stage(trainer, model, stage_name, output_dir, num_epochs)
 
-    # Load validation once (small — cap at 10 k docs)
-    print(f"\nLoading validation split '{val_split}' (max 10k docs) ...")
-    val_texts: List[str] = []
-    for shard in shard_iterator(DATASET_REPO, val_split, shard_size=10000, max_samples=10000):
-        val_texts.extend(shard)
-        if len(val_texts) >= 10000:
-            break
-    val_loader = build_loader(val_texts, tokenizer, cfg.seq_len, batch_size, shuffle=False, drop_last=False)
-    print(f"  Val docs: {len(val_texts)} | Val batches: {len(val_loader)}")
-
-    # Epoch loop
-    for epoch in range(start_epoch, epochs + 1):
+    # Run epochs
+    for epoch in range(start_epoch, num_epochs + 1):
         print(f"\n{'='*60}")
-        print(f"{stage_name.upper()} | Epoch {epoch}/{epochs} | LR={lr}")
+        print(f"{stage_name.upper()} | Epoch {epoch}/{num_epochs}")
         print(f"{'='*60}")
 
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        accum_count = 0
-        optimizer.zero_grad()
+        train_m = trainer.train_epoch(epoch)
+        print(f"  Train loss: {train_m['loss']:.4f} | PPL: {train_m['perplexity']:.2f} | "
+              f"Time: {train_m['time']:.1f}s | tok/s: {train_m.get('tok_per_sec', 'N/A')}")
 
-        shard_idx = 0
-        for train_texts in shard_iterator(
-            DATASET_REPO, train_split, shard_size, max_samples
-        ):
-            shard_idx += 1
-            print(f"  Shard {shard_idx:02d} | {len(train_texts):,} docs")
+        if trainer.val_loader and epoch % preset["eval_every"] == 0:
+            val_m = trainer.evaluate()
+            print(f"  Val loss:   {val_m['loss']:.4f} | Val PPL: {val_m['perplexity']:.2f}")
+            if val_m["loss"] < trainer.best_val_loss:
+                trainer.best_val_loss = val_m["loss"]
+                model.save_pretrained(os.path.join(trainer.output_dir, "best_model"))
 
-            train_loader = build_loader(
-                train_texts, tokenizer, cfg.seq_len, batch_size, shuffle=True, drop_last=True
-            )
-
-            pbar = tqdm(train_loader, desc=f"Ep{epoch} Sh{shard_idx}", leave=False)
-            for batch_idx, batch in enumerate(pbar):
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
-
-                outputs = model(input_ids, labels=labels)
-                loss = outputs["loss"] / grad_accum
-                loss.backward()
-
-                accum_count += 1
-                epoch_loss += loss.item() * grad_accum
-                num_batches += 1
-
-                is_last = (batch_idx + 1) == len(train_loader)
-                if accum_count >= grad_accum or is_last:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    accum_count = 0
-                    global_step += 1
-
-                # Live postfix
-                avg = epoch_loss / max(num_batches, 1)
-                pbar.set_postfix(
-                    {
-                        "loss": f"{avg:.4f}",
-                        "ppl": f"{math.exp(min(avg, 20)):.1f}",
-                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-                    }
-                )
-
-            # AGGRESSIVE CLEANUP between shards
-            del train_loader, train_texts
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # End of epoch
-        avg_loss = epoch_loss / max(num_batches, 1)
-        ppl = math.exp(min(avg_loss, 20))
-        print(f"\nEpoch {epoch} done | loss={avg_loss:.4f} | ppl={ppl:.2f}")
-
-        # Validation
-        val_loss = eval_model(model, val_loader, device)
-        val_ppl = math.exp(min(val_loss, 20))
-        print(f"Val loss={val_loss:.4f} | val_ppl={val_ppl:.2f}")
-
-        # Save everything
-        save_resume(output_dir, model, optimizer, scheduler, epoch, global_step, stage_name)
-        model.save_pretrained(os.path.join(output_dir, f"{stage_name}_epoch_{epoch:03d}"))
-
-        # Generation sanity check
-        if example_prompts:
-            model.eval()
-            print("\nGeneration samples:")
+        # Generation samples
+        if tokenizer and epoch % preset["eval_every"] == 0:
+            print("\n  Generation samples:")
             for prompt in example_prompts[:3]:
                 try:
                     ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
                     out = model.generate_ext(ids, max_new_tokens=40, temperature=0.8, top_k=50)
                     text = tokenizer.decode(out[0], skip_special_tokens=True)
-                    print(f"  '{prompt}' -> '{text[len(prompt):].strip()}'")
+                    print(f"    '{prompt}' -> '{text[len(prompt):].strip()}'")
                 except Exception as e:
-                    print(f"  [gen error] {e}")
-            model.train()
+                    print(f"    Error: {e}")
 
-    # Cleanup
-    del val_loader, val_texts
-    gc.collect()
+        # Save resume every epoch
+        _save_resume_checkpoint(trainer, model, epoch, stage_name, output_dir, tokenizer)
+
+    # Final stage export
+    final_dir = os.path.join(output_dir, f"{stage_name}-final")
+    model.save_pretrained(final_dir)
+    print(f"\n  Stage {stage_name} complete. Saved to {final_dir}")
+
+    if push_to_hub and hf_token and timestamp:
+        repo = f"{hf_org}/HelixLM-13M-{stage_name}-{timestamp}"
+        print(f"  Pushing to {repo}")
+        model.push_to_hub(repo, token=hf_token, private=False)
+        tokenizer._backend.push_to_hub(repo, token=hf_token)
+
     return model
 
 
@@ -414,183 +316,184 @@ def train_stage(
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=24)
+    parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--output-dir", type=str, default="./helixlm-13m-fast")
+    parser.add_argument("--output-dir", type=str, default="./helixlm-13m-resume")
     parser.add_argument("--hf-org", type=str, default="david-thrower")
     parser.add_argument("--push-to-hub", action="store_true")
-    parser.add_argument("--no-titans", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--grad-accum", type=int, default=None)
-    parser.add_argument("--shard-size", type=int, default=None)
+    parser.add_argument("--use-ssm", action="store_true", help="Enable Mamba2 (NOT recommended, kills throughput)")
+    parser.add_argument("--no-titans", action="store_true", help="Disable Titans memory")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    device = get_device()
+    preset = PRESETS[args.seq_len]
 
-    # Auto-detect preset
-    preset = detect_gpu_preset(args.seq_len)
-    batch_size = args.batch_size or preset["batch_size"]
-    grad_accum = args.grad_accum or preset["grad_accum"]
-    shard_size = args.shard_size or preset["shard_size"]
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+
+    device = get_device()
+    TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M")
 
     print(f"\n{'='*60}")
-    print(f"HelixLM 13M Fast | GPU={preset['label']} | Compile=ON")
-    print(f"Batch={batch_size} | Accum={grad_accum} | Shard={shard_size} | Seq={args.seq_len}")
+    print(f"HelixLM 13M Resume Job | SeqLen={preset['seq_len']} | A100 Proven Config")
+    print(f"Batch={args.batch_size} | Accum={args.grad_accum} | Titans={not args.no_titans} | SSM={args.use_ssm}")
     print(f"{'='*60}")
 
-    # Tokenizer
     tokenizer = HelixTokenizer("gpt2")
     vocab_size = len(tokenizer)
     print(f"Vocab: {vocab_size}")
 
-    # Config: 13 M with all unique features ON
     cfg = HelixConfig.tiny(
         vocab_size=vocab_size,
-        seq_len=args.seq_len,
+        seq_len=preset["seq_len"],
         tokenizer_name="gpt2",
         attention_mode="hybrid",
         hybrid_full_attention_interval=2,
         n_loops=2,
-        use_ssm=True,
-        ssm_d_state=64,
+        use_ssm=args.use_ssm,
         use_titans_memory=not args.no_titans,
         use_rope=True,
         ffn_expansion=2.0,
         dropout=0.0,
-        lr=3e-3,
-        weight_decay=0.05,
-        grad_clip=1.0,
-        warmup_steps=2000,
+        lr=preset["lr_stage1"],
+        weight_decay=preset["weight_decay"],
+        grad_clip=preset["grad_clip"],
+        warmup_steps=preset["warmup_steps"],
         device=str(device),
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
     )
+    cfg.batch_size = args.batch_size
 
-    # Model
     model = HelixForCausalLM(cfg).to(device)
     param_count = model.count_parameters()["total"]
-    print(f"Parameters: {param_count:,} (~{param_count / 1e6:.1f}M)")
+    print(f"Parameters: {param_count:,} (~{param_count/1e6:.1f}M)")
 
-    # CRITICAL: compile the recurrent core to fuse Python loops
-    print("\nCompiling model with torch.compile (reduce-overhead)...")
-    try:
-        model.model = torch.compile(model.model, mode="reduce-overhead")
-        print("  torch.compile OK.")
-    except Exception as e:
-        print(f"  torch.compile warning (continuing): {e}")
+    if not (12_000_000 <= param_count <= 14_000_000):
+        print(f"WARNING: Expected ~13M params, got {param_count:,}")
+
+    print_model_report(cfg, model, preset, "INIT")
+
+    # GPU warmup
+    print("\nWarming up GPU...")
+    dummy = torch.randint(0, vocab_size, (args.batch_size, preset["seq_len"]), device=device)
+    with torch.no_grad():
+        _ = model(dummy)
+    torch.cuda.synchronize()
+    print("Warmup complete.")
 
     HF_TOKEN = os.getenv("HF_TOKEN")
     if args.push_to_hub and not HF_TOKEN:
-        print("ERROR: HF_TOKEN not set")
-        sys.exit(1)
+        raise RuntimeError("HF_TOKEN not set")
 
-    TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M")
+    # ------------------------------------------------------------------
+    # Global resume: load latest model weights across all stages
+    # ------------------------------------------------------------------
+    global_resume_dir = _find_global_resume(args.output_dir)
+    if global_resume_dir:
+        print(f"\n[INIT] Resuming from global checkpoint: {global_resume_dir}")
+        state = torch.load(os.path.join(global_resume_dir, "trainer_state.pt"), map_location="cpu")
+        model.load_state_dict(state["model_state_dict"])
+        if state.get("rng") is not None:
+            torch.set_rng_state(state["rng"])
+        if state.get("cuda_rng") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+        print("[INIT] Model weights restored.")
 
-    # =====================================================================
-    # STAGE 1A: High-LR descent (3 epochs @ 3e-3)
-    # =====================================================================
-    model = train_stage(
-        model=model,
-        cfg=cfg,
-        tokenizer=tokenizer,
-        device=device,
-        stage_name="stage1a",
-        lr=3.0e-3,
-        epochs=3,
-        train_split="pretrain_train",
-        val_split="pretrain_val",
-        shard_size=shard_size,
-        batch_size=batch_size,
-        grad_accum=grad_accum,
-        output_dir=os.path.join(args.output_dir, "stage1a"),
-        example_prompts=PRETRAIN_PROMPTS,
-        max_samples=args.max_samples,
-    )
+    # ------------------------------------------------------------------
+    # Stage 1A + 1B (pretrain data)
+    # ------------------------------------------------------------------
+    run_1a = not _stage_is_complete(args.output_dir, "stage1a", preset["epochs_stage1a"])
+    run_1b = not _stage_is_complete(args.output_dir, "stage1b", preset["epochs_stage1b"])
 
-    stage1a_final = os.path.join(args.output_dir, "stage1a", "final")
-    model.save_pretrained(stage1a_final)
-    if args.push_to_hub:
-        repo = f"{args.hf_org}/HelixLM-13M-stage1a-{TIMESTAMP}"
-        print(f"\nPushing Stage 1A to {repo}")
-        model.push_to_hub(repo, token=HF_TOKEN, private=False)
-        tokenizer._backend.push_to_hub(repo, token=HF_TOKEN)
+    if run_1a or run_1b:
+        print("\nLoading pretrain splits...")
+        pretrain_train = load_texts(DATASET_REPO, "pretrain_train", args.max_samples)
+        pretrain_val = load_texts(DATASET_REPO, "pretrain_val", args.max_samples)
 
-    # =====================================================================
-    # STAGE 1B: Grokking (5 epochs @ 3e-4)
-    # =====================================================================
-    model = train_stage(
-        model=model,
-        cfg=cfg,
-        tokenizer=tokenizer,
-        device=device,
-        stage_name="stage1b",
-        lr=3.0e-4,
-        epochs=5,
-        train_split="pretrain_train",
-        val_split="pretrain_val",
-        shard_size=shard_size,
-        batch_size=batch_size,
-        grad_accum=grad_accum,
-        output_dir=os.path.join(args.output_dir, "stage1b"),
-        example_prompts=PRETRAIN_PROMPTS,
-        max_samples=args.max_samples,
-    )
+        if run_1a:
+            model = run_stage(
+                model, cfg, tokenizer, device,
+                stage_name="stage1a",
+                lr=preset["lr_stage1"],
+                num_epochs=preset["epochs_stage1a"],
+                train_texts=pretrain_train,
+                val_texts=pretrain_val,
+                output_dir=args.output_dir,
+                preset=preset,
+                example_prompts=PRETRAIN_PROMPTS,
+                push_to_hub=args.push_to_hub,
+                hf_org=args.hf_org,
+                hf_token=HF_TOKEN,
+                timestamp=TIMESTAMP,
+            )
 
-    stage1_final = os.path.join(args.output_dir, "stage1b", "final")
-    model.save_pretrained(stage1_final)
-    if args.push_to_hub:
-        repo = f"{args.hf_org}/HelixLM-13M-stage1b-{TIMESTAMP}"
-        print(f"\nPushing Stage 1B to {repo}")
-        model.push_to_hub(repo, token=HF_TOKEN, private=False)
-        tokenizer._backend.push_to_hub(repo, token=HF_TOKEN)
+        if run_1b:
+            model = run_stage(
+                model, cfg, tokenizer, device,
+                stage_name="stage1b",
+                lr=preset["lr_grok"],
+                num_epochs=preset["epochs_stage1b"],
+                train_texts=pretrain_train,
+                val_texts=pretrain_val,
+                output_dir=args.output_dir,
+                preset=preset,
+                example_prompts=PRETRAIN_PROMPTS,
+                push_to_hub=args.push_to_hub,
+                hf_org=args.hf_org,
+                hf_token=HF_TOKEN,
+                timestamp=TIMESTAMP,
+            )
 
-    # =====================================================================
-    # STAGE 2: Instruction tuning (2 epochs @ 3e-4)
-    # =====================================================================
-    model = train_stage(
-        model=model,
-        cfg=cfg,
-        tokenizer=tokenizer,
-        device=device,
-        stage_name="stage2",
-        lr=3.0e-4,
-        epochs=2,
-        train_split="instruct_train",
-        val_split="instruct_val",
-        shard_size=shard_size,
-        batch_size=batch_size,
-        grad_accum=grad_accum,
-        output_dir=os.path.join(args.output_dir, "stage2"),
-        example_prompts=INSTRUCT_PROMPTS,
-        max_samples=args.max_samples,
-    )
+        del pretrain_train, pretrain_val
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------
+    # Stage 2 (instruct data)
+    # ------------------------------------------------------------------
+    if not _stage_is_complete(args.output_dir, "stage2", preset["epochs_stage2"]):
+        print("\nLoading instruct splits...")
+        instruct_train = load_texts(DATASET_REPO, "instruct_train", args.max_samples)
+        instruct_val = load_texts(DATASET_REPO, "instruct_val", args.max_samples)
+
+        model = run_stage(
+            model, cfg, tokenizer, device,
+            stage_name="stage2",
+            lr=preset["lr_stage2"],
+            num_epochs=preset["epochs_stage2"],
+            train_texts=instruct_train,
+            val_texts=instruct_val,
+            output_dir=args.output_dir,
+            preset=preset,
+            example_prompts=INSTRUCT_PROMPTS,
+            push_to_hub=args.push_to_hub,
+            hf_org=args.hf_org,
+            hf_token=HF_TOKEN,
+            timestamp=TIMESTAMP,
+        )
+
+    # ------------------------------------------------------------------
+    # Final
+    # ------------------------------------------------------------------
     final_path = os.path.join(args.output_dir, "final")
     model.save_pretrained(final_path)
     tokenizer._backend.save_pretrained(final_path)
 
-    # Metadata
     metadata = {
         "parameters": param_count,
-        "seq_len": args.seq_len,
-        "batch_size": batch_size,
-        "grad_accum": grad_accum,
-        "shard_size": shard_size,
-        "gpu": preset["label"],
-        "compiled": True,
+        "seq_len": preset["seq_len"],
+        "batch_size": args.batch_size,
         "timestamp": TIMESTAMP,
     }
     with open(os.path.join(final_path, "training_metadata.json"), "w") as f:
         json.dump(metadata, f, indent=2)
-
-    if args.push_to_hub:
-        repo = f"{args.hf_org}/HelixLM-13M-final-{TIMESTAMP}"
-        print(f"\nPushing final to {repo}")
-        model.push_to_hub(repo, token=HF_TOKEN, private=False)
-        tokenizer._backend.push_to_hub(repo, token=HF_TOKEN)
 
     print(f"\n{'='*60}")
     print("COMPLETE")
