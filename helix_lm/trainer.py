@@ -1,15 +1,22 @@
 """
 HelixLM Trainer with gradient accumulation, configurable AMP, and progress bars.
 
-Key features:
-  - Gradient accumulation for effective larger batch sizes
-  - Configurable AMP (default: off for stability on small models)
-  - NaN/Inf detection and batch skipping
-  - Scheduler steps count optimizer steps, not raw batches
-  - Uses DocumentAwareDataset (no cross-document boundary crossings)
-  - Modern torch.amp API (not deprecated torch.cuda.amp)
-  - Live tqdm progress bars with loss, PPL, LR, and throughput metrics
-  - Optional train/val DataLoader injection for custom dataset pipelines
+Key fixes in this revision:
+  * Added num_workers and pin_memory args (defaults: num_workers=min(4, cpu_count),
+    pin_memory=True when CUDA available).
+  * All .to(device) calls use non_blocking=True for async H2D transfers.
+  * AMP loss reporting fixed: raw_loss captured BEFORE scaler.scale(loss).
+    total_loss accumulates raw_loss.item() WITHOUT * divisor.
+  * REMOVED all len(self.train_loader) calls to prevent eager chunking of lazy
+    map-style datasets (DocumentAwareDataset) at epoch start.
+  * tqdm wraps iter(self.train_loader) / enumerate(self.train_loader) to suppress
+    implicit len() calls that would trigger the same eager chunking.
+  * Scheduler uses cfg.steps_per_epoch if provided, otherwise a conservative default.
+  * End-of-epoch gradient flush handles incomplete accumulation windows.
+  * Uses DocumentAwareDataset (no cross-document boundary crossings).
+  * Modern torch.amp API (not deprecated torch.cuda.amp).
+  * Live tqdm progress bars with loss, PPL, LR, and throughput metrics.
+  * Optional train/val DataLoader injection for custom dataset pipelines.
 """
 import os
 import math
@@ -27,7 +34,7 @@ from tqdm import tqdm
 
 from .config import HelixConfig
 from .hf_model import HelixForCausalLM
-from .dataset import create_document_loader
+from .dataset import create_document_loader, create_streaming_loader
 
 
 def get_cosine_schedule_with_warmup(
@@ -85,6 +92,8 @@ class Trainer:
         train_loader: Optional[DataLoader] = None,
         val_loader: Optional[DataLoader] = None,
         verbose: bool = True,
+        num_workers: int = -1,
+        pin_memory: bool = True,
     ):
         """
         Initialize Trainer.
@@ -104,6 +113,8 @@ class Trainer:
             train_loader: Optional custom DataLoader to override built-in dataset creation.
             val_loader: Optional custom DataLoader to override built-in dataset creation.
             verbose: Whether to show tqdm progress bars and print logs.
+            num_workers: DataLoader workers. -1 = auto (min(4, cpu_count)).
+            pin_memory: Use pinned memory for async CPU->GPU transfer.
         """
         self.model = model
         self.cfg = cfg
@@ -127,6 +138,13 @@ class Trainer:
         self.device = self._get_device()
         self.model = self.model.to(self.device)
 
+        # Determine num_workers
+        if num_workers < 0:
+            import multiprocessing
+            num_workers = min(4, multiprocessing.cpu_count())
+        self.num_workers = num_workers
+        self.pin_memory = pin_memory and torch.cuda.is_available()
+
         # Validate config
         self.validate_config()
 
@@ -144,6 +162,8 @@ class Trainer:
                 shuffle=True,
                 min_tail_len=min_tail_len,
                 lazy=True,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
             )
 
         self.val_loader = None
@@ -159,6 +179,8 @@ class Trainer:
                 drop_last=False,
                 min_tail_len=min_tail_len,
                 lazy=True,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
             )
 
         # AdamW with standard betas (0.9, 0.999)
@@ -169,9 +191,8 @@ class Trainer:
             betas=(0.9, 0.999),
         )
 
-        # Scheduler steps count optimizer steps, not raw batches
-        # DEFERRED: avoid len() on lazy datasets to prevent eager chunking at init time.
-        # The scheduler is built on the first train_epoch() call when length is known.
+        # Scheduler steps count optimizer steps, not raw batches.
+        # DEFERRED: avoid len() on IterableDataset or lazy datasets at init time.
         self._scheduler_warmup = max(1, cfg.warmup_steps // self.grad_accum_steps)
         self._scheduler_cycles = 0.5
         self._scheduler_min_lr = 0.1
@@ -216,6 +237,28 @@ class Trainer:
                 stacklevel=2,
             )
 
+    def _init_scheduler(self, steps_per_epoch: Optional[int] = None) -> None:
+        """Lazy scheduler initialization. Never calls len(train_loader)."""
+        if self.scheduler is not None:
+            return
+
+        if steps_per_epoch is None:
+            # No len() call — avoids eager chunking on lazy map datasets
+            # and is required for IterableDataset.
+            # Use cfg attribute if available, otherwise conservative default.
+            steps_per_epoch = getattr(self.cfg, "steps_per_epoch", None)
+            if steps_per_epoch is None:
+                steps_per_epoch = 1000
+
+        total_optimizer_steps = steps_per_epoch * self.cfg.epochs
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=self._scheduler_warmup,
+            num_training_steps=total_optimizer_steps,
+            num_cycles=self._scheduler_cycles,
+            min_lr_ratio=self._scheduler_min_lr,
+        )
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch with gradient accumulation and progress bar."""
         self.model.train()
@@ -228,32 +271,23 @@ class Trainer:
 
         self.optimizer.zero_grad()
 
-        # Lazily initialize scheduler now that we know real loader length.
-        # This avoids forcing DocumentAwareDataset(lazy=True) to chunk all
-        # documents during Trainer construction.
+        # Lazily initialize scheduler. We NEVER call len(self.train_loader) here
+        # to prevent eager chunking of lazy map-style datasets at epoch start.
         if self.scheduler is None:
-            steps_per_epoch = math.ceil(
-                len(self.train_loader) / self.grad_accum_steps
-            )
-            total_optimizer_steps = steps_per_epoch * self.cfg.epochs
-            self.scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=self._scheduler_warmup,
-                num_training_steps=total_optimizer_steps,
-                num_cycles=self._scheduler_cycles,
-                min_lr_ratio=self._scheduler_min_lr,
-            )
+            self._init_scheduler(steps_per_epoch=None)
 
+        # Use iter() to suppress tqdm's implicit len() call, which would
+        # trigger DocumentAwareDataset.__len__() -> _ensure_chunks() eagerly.
         pbar = tqdm(
-            self.train_loader,
+            iter(self.train_loader),
             desc=f"Epoch {epoch}",
             unit="batch",
             disable=not self.verbose,
         )
 
-        for batch_idx, batch in enumerate(pbar):
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+        for batch in pbar:
+            input_ids = batch["input_ids"].to(self.device, non_blocking=self.pin_memory)
+            labels = batch["labels"].to(self.device, non_blocking=self.pin_memory)
             tokens_seen += input_ids.numel()
 
             # Forward pass
@@ -267,25 +301,22 @@ class Trainer:
                 outputs = self.model(input_ids, labels=labels)
                 loss = outputs["loss"]
 
+            # Capture raw loss BEFORE any scaling/division for accurate reporting.
+            # This is the TRUE, unscaled loss value.
+            raw_loss = loss.detach().clone()
+
             # Skip NaN/Inf losses (numerical instability)
-            if torch.isnan(loss) or torch.isinf(loss):
+            if torch.isnan(raw_loss) or torch.isinf(raw_loss):
                 skipped_batches += 1
                 if skipped_batches <= 5 and self.verbose:
                     print(
-                        f"  WARNING: NaN/Inf loss at batch {batch_idx}. "
+                        f"  WARNING: NaN/Inf loss at batch {raw_count}. "
                         f"Skipping. (Try disabling AMP: use_amp=False)"
                     )
                 continue
 
-            # Scale loss for gradient accumulation
-            divisor = 1
-            if self.grad_accum_steps > 1:
-                is_last = (batch_idx + 1) == len(self.train_loader)
-                if is_last and accum_count < self.grad_accum_steps - 1:
-                    divisor = accum_count + 1
-                else:
-                    divisor = self.grad_accum_steps
-                loss = loss / divisor
+            # Scale loss for gradient accumulation (gradients are averaged over window)
+            loss = loss / self.grad_accum_steps
 
             # Backward pass
             if self.use_amp and self.scaler is not None:
@@ -294,12 +325,12 @@ class Trainer:
                 loss.backward()
 
             accum_count += 1
-            total_loss += loss.item() * divisor
+            # raw_loss is the FULL loss (before division), so do NOT multiply by divisor.
+            total_loss += raw_loss.item()
             raw_count += 1
 
-            # Optimizer step after accumulation
-            is_last = (batch_idx + 1) == len(self.train_loader)
-            if accum_count >= self.grad_accum_steps or is_last:
+            # Optimizer step after accumulation window is full
+            if accum_count >= self.grad_accum_steps:
                 if self.use_amp and self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
@@ -330,6 +361,27 @@ class Trainer:
                 "tok/s": f"{tok_per_sec:,.0f}",
             })
 
+        # End-of-epoch flush: if any gradients remain unstepped, step now.
+        # The gradients were divided by grad_accum_steps; if accum_count < grad_accum_steps,
+        # the update is slightly weaker than a full window. This is standard practice.
+        if accum_count > 0:
+            if self.use_amp and self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.grad_clip
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.cfg.grad_clip
+                )
+                self.optimizer.step()
+            self.scheduler.step()
+            self.optimizer.zero_grad()
+            accum_count = 0
+            self.global_step += 1
+
         avg_loss = total_loss / max(raw_count, 1)
         return {
             "loss": avg_loss,
@@ -347,15 +399,16 @@ class Trainer:
         total_loss = 0.0
         num_batches = 0
 
+        # iter() suppresses tqdm's implicit len() call
         pbar = tqdm(
-            self.val_loader,
+            iter(self.val_loader),
             desc="Validation",
             unit="batch",
             disable=not self.verbose,
         )
         for batch in pbar:
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+            input_ids = batch["input_ids"].to(self.device, non_blocking=self.pin_memory)
+            labels = batch["labels"].to(self.device, non_blocking=self.pin_memory)
 
             if self.use_amp and self.scaler is not None:
                 with torch.amp.autocast(
@@ -484,4 +537,3 @@ class Trainer:
         if self.verbose:
             print(f"\nTraining complete!")
         return self.history
-
