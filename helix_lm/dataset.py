@@ -1,14 +1,15 @@
 """
 HelixLM Dataset with rolling text chunking and natural stop detection.
 
-Key fixes in this revision
-  * DocumentAwareDataset now tracks exact pad_len in every chunk tuple.
-    It NEVER scans backwards for pad_token_id, so GPT-2 (pad_id == eos_id)
-    cannot accidentally mask a real EOS.
-  * Optional within-document overlap (stride) added to DocumentAwareDataset.
-    stride == seq_len  -> non-overlapping (default).
-    stride <  seq_len  -> overlapping windows; overlap is masked in labels.
-  * No cross-document boundaries are ever crossed.
+Key fixes in this revision:
+  * HelixDataset lazy mode now caches tokenized docs, eliminating per-batch
+    tokenizer.encode() calls that caused ~1-2s blocking per sample.
+  * StreamingDocumentDataset (IterableDataset) added for corpora larger than RAM.
+    It shards across workers, yields chunks on-the-fly, and never materializes
+    chunk lists or full text lists in memory.
+  * create_document_loader / create_helix_dataloader now expose num_workers
+    and pin_memory, defaulting to pin_memory=True when CUDA is available.
+  * _default_collate_fn extracted to avoid duplication.
 
 Compatible with both eager and lazy loading.
 """
@@ -18,6 +19,19 @@ from typing import List, Optional, Iterator, Dict, Any, Union, Tuple
 import torch
 from torch.utils.data import IterableDataset, Dataset, DataLoader
 from tqdm import tqdm
+
+
+def _default_collate_fn(batch):
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    labels = torch.stack([b["labels"] for b in batch])
+    attention_mask = torch.stack([b["attention_mask"] for b in batch])
+    is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "is_natural_stop": is_natural_stop,
+    }
 
 
 class HelixDataset(Dataset):
@@ -92,7 +106,9 @@ class HelixDataset(Dataset):
                 index.append((doc_idx, 0, True))
         return index
 
-    def _build_lazy_chunk_index(self) -> List[Tuple[int, int, int, bool]]:
+    def _build_lazy_index_and_docs(self):
+        """Build chunk index AND cache tokenized docs in lazy mode."""
+        docs = []
         index = []
         for doc_idx, text in enumerate(self.texts):
             text = text.strip()
@@ -104,37 +120,34 @@ class HelixDataset(Dataset):
             length = len(ids)
             if length == 0:
                 continue
+            docs.append({"ids": ids, "length": length})
             if length >= self.seq_len:
                 for start_idx in range(0, length - self.seq_len + 1, self.stride):
                     end_idx = start_idx + self.seq_len
                     is_natural_stop = end_idx >= length * self.natural_stop_threshold
-                    index.append((doc_idx, start_idx, length, is_natural_stop))
+                    index.append((doc_idx, start_idx, is_natural_stop))
                     if end_idx >= length:
                         break
             else:
-                index.append((doc_idx, 0, length, True))
-        return index
+                index.append((doc_idx, 0, True))
+        self._tokenized_docs = docs
+        self._chunk_index = index
+        self.texts = None  # free memory
 
     def __len__(self) -> int:
         if self._chunk_index is not None:
             return len(self._chunk_index)
-        if not hasattr(self, '_lazy_index') or self._lazy_index is None:
-            self._lazy_index = self._build_lazy_chunk_index()
-        return len(self._lazy_index)
+        if self._chunk_index is None:
+            self._build_lazy_index_and_docs()
+        return len(self._chunk_index)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        if self._chunk_index is not None:
-            doc_idx, start_idx, is_natural_stop = self._chunk_index[idx]
-            ids = self._tokenized_docs[doc_idx]["ids"]
-            length = self._tokenized_docs[doc_idx]["length"]
-        else:
-            if not hasattr(self, '_lazy_index') or self._lazy_index is None:
-                self._lazy_index = self._build_lazy_chunk_index()
-            doc_idx, start_idx, length, is_natural_stop = self._lazy_index[idx]
-            text = self.texts[doc_idx].strip()
-            ids = self.tokenizer.encode(text, add_special_tokens=False)
-            if self.add_eos and hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
-                ids.append(self.tokenizer.eos_token_id)
+        if self._chunk_index is None:
+            self._build_lazy_index_and_docs()
+
+        doc_idx, start_idx, is_natural_stop = self._chunk_index[idx]
+        ids = self._tokenized_docs[doc_idx]["ids"]
+        length = self._tokenized_docs[doc_idx]["length"]
 
         if length >= self.seq_len:
             end_idx = start_idx + self.seq_len
@@ -170,7 +183,7 @@ class DocumentAwareDataset(Dataset):
     Per-document chunking with no cross-document boundaries.
 
     Chunk tuple format (built in _build_chunks):
-        (token_ids, is_natural_stop, pad_len, overlap_mask_len)
+        (token_ids: List[int], is_natural: bool, pad_len: int, overlap_mask_len: int)
 
       * pad_len: exact number of padded positions at the TAIL.
                  Used to set labels[-pad_len:] = -100.
@@ -338,6 +351,143 @@ class DocumentAwareDataset(Dataset):
         return self._stats
 
 
+class StreamingDocumentDataset(IterableDataset):
+    """
+    IterableDataset for corpora larger than RAM.
+
+    Streams documents from an iterable (e.g. HF streaming dataset),
+    tokenizes on-the-fly, yields chunks, and discards them immediately.
+    Supports multi-worker sharding via worker_info.
+
+    Args:
+        text_iterable: Iterable yielding dicts with key text_column or raw strings.
+        tokenizer: Tokenizer with encode() method.
+        seq_len: Context length.
+        stride: Overlap stride (default seq_len = no overlap).
+        min_tail_len: Minimum tail length to keep (default seq_len//4).
+        add_eos: Append EOS token.
+        text_column: Key to extract text from dict items.
+        max_samples: Optional cap on total documents processed.
+    """
+    def __init__(
+        self,
+        text_iterable,
+        tokenizer,
+        seq_len: int = 2048,
+        stride: Optional[int] = None,
+        min_tail_len: Optional[int] = None,
+        add_eos: bool = True,
+        text_column: str = "text",
+        max_samples: Optional[int] = None,
+    ):
+        super().__init__()
+        self.text_iterable = text_iterable
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.stride = stride if stride is not None else seq_len
+        if not (1 <= self.stride <= self.seq_len):
+            raise ValueError(f"stride must be in [1, seq_len], got {self.stride}")
+        self.min_tail_len = min_tail_len if min_tail_len is not None else seq_len // 4
+        self.add_eos = add_eos
+        self.text_column = text_column
+        self.max_samples = max_samples
+
+        self.pad_id = getattr(tokenizer, "pad_token_id", None)
+        if self.pad_id is None:
+            self.pad_id = getattr(tokenizer, "eos_token_id", 0)
+        self.eos_id = getattr(tokenizer, "eos_token_id", None)
+
+    def _tokenize_text(self, text: str):
+        text = text.strip()
+        if not text:
+            return None
+        ids = self.tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) < self.min_tail_len:
+            return None
+        if self.add_eos and self.eos_id is not None:
+            ids.append(self.eos_id)
+        return ids
+
+    def _chunk_document(self, ids: List[int]):
+        length = len(ids)
+        if length >= self.seq_len:
+            starts = list(range(0, length - self.seq_len + 1, self.stride))
+            for i, start in enumerate(starts):
+                chunk = ids[start:start + self.seq_len]
+                is_last = (i == len(starts) - 1)
+                reaches_end = (start + self.seq_len == length)
+                if not is_last:
+                    is_natural = False
+                else:
+                    tail_len = length - (start + self.seq_len)
+                    has_tail = tail_len >= self.min_tail_len
+                    is_natural = reaches_end or (not has_tail)
+                overlap_mask = 0
+                if start > 0 and self.stride < self.seq_len:
+                    overlap_mask = self.seq_len - self.stride
+                yield (chunk, is_natural, 0, overlap_mask)
+
+            last_covered = starts[-1] + self.seq_len if starts else 0
+            remainder = length - last_covered
+            if remainder >= self.min_tail_len:
+                tail = ids[last_covered:]
+                pad_len = self.seq_len - remainder
+                tail = tail + [self.pad_id] * pad_len
+                yield (tail, True, pad_len, 0)
+            elif remainder > 0 and starts:
+                # Tail too short: mark last chunk as natural stop (already yielded)
+                pass
+        else:
+            pad_len = self.seq_len - length
+            chunk = ids + [self.pad_id] * pad_len
+            yield (chunk, True, pad_len, 0)
+
+    def _make_tensor(self, chunk, is_natural, pad_len, overlap_mask):
+        x = torch.tensor(chunk, dtype=torch.long)
+        labels = x.clone()
+        if overlap_mask > 0:
+            labels[:overlap_mask] = -100
+        if pad_len > 0:
+            labels[-pad_len:] = -100
+        return {
+            "input_ids": x,
+            "labels": labels,
+            "attention_mask": (x != self.pad_id).long(),
+            "is_natural_stop": torch.tensor(is_natural, dtype=torch.bool),
+        }
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            # Single-process: iterate all
+            it = iter(self.text_iterable)
+            for i, item in enumerate(it):
+                if self.max_samples is not None and i >= self.max_samples:
+                    break
+                text = item[self.text_column] if isinstance(item, dict) else item
+                ids = self._tokenize_text(text)
+                if ids is None:
+                    continue
+                for chunk_tuple in self._chunk_document(ids):
+                    yield self._make_tensor(*chunk_tuple)
+        else:
+            # Multi-worker sharding
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            it = iter(self.text_iterable)
+            for i, item in enumerate(it):
+                if self.max_samples is not None and i >= self.max_samples:
+                    break
+                if i % num_workers != worker_id:
+                    continue
+                text = item[self.text_column] if isinstance(item, dict) else item
+                ids = self._tokenize_text(text)
+                if ids is None:
+                    continue
+                for chunk_tuple in self._chunk_document(ids):
+                    yield self._make_tensor(*chunk_tuple)
+
+
 class HelixDatasetFromTokens(Dataset):
     """
     Dataset from pre-tokenized token stream (e.g., from HF datasets).
@@ -472,28 +622,18 @@ def create_helix_dataloader(
     num_workers: int = 0,
     drop_last: bool = True,
     lazy: bool = True,
+    pin_memory: bool = True,
     **kwargs,
 ) -> torch.utils.data.DataLoader:
     dataset = HelixDataset(texts, tokenizer, seq_len, stride, lazy=lazy, **kwargs)
 
-    def collate_fn(batch):
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        labels = torch.stack([b["labels"] for b in batch])
-        attention_mask = torch.stack([b["attention_mask"] for b in batch])
-        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "is_natural_stop": is_natural_stop,
-        }
-
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=collate_fn,
+        collate_fn=_default_collate_fn,
         shuffle=shuffle,
         num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=drop_last,
     )
 
@@ -510,6 +650,7 @@ def create_document_loader(
     add_eos: bool = True,
     lazy: bool = True,
     stride: Optional[int] = None,
+    pin_memory: bool = True,
 ) -> DataLoader:
     """
     Create a DataLoader using DocumentAwareDataset (no boundary crossings).
@@ -518,30 +659,63 @@ def create_document_loader(
         stride: If < seq_len, enables within-document overlap (default: seq_len).
                 This restores more optimizer steps per epoch without ever
                 crossing document boundaries.
+        num_workers: Number of DataLoader workers. >0 enables background
+                     tokenization/chunking to keep GPU fed.
+        pin_memory: If True (default) and CUDA available, uses pinned memory
+                    for faster async CPU->GPU transfers.
     """
     ds = DocumentAwareDataset(
         texts, tokenizer, seq_len,
         min_tail_len=min_tail_len, add_eos=add_eos, lazy=lazy, stride=stride,
     )
 
-    def collate_fn(batch):
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        labels = torch.stack([b["labels"] for b in batch])
-        attention_mask = torch.stack([b["attention_mask"] for b in batch])
-        is_natural_stop = torch.stack([b["is_natural_stop"] for b in batch])
-        return {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-            "is_natural_stop": is_natural_stop,
-        }
-
     return DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=shuffle,
-        collate_fn=collate_fn,
+        collate_fn=_default_collate_fn,
         num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
         drop_last=drop_last,
     )
-  
+
+
+def create_streaming_loader(
+    text_iterable,
+    tokenizer,
+    seq_len: int = 2048,
+    batch_size: int = 8,
+    stride: Optional[int] = None,
+    min_tail_len: Optional[int] = None,
+    add_eos: bool = True,
+    text_column: str = "text",
+    max_samples: Optional[int] = None,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """
+    Create a DataLoader from a streaming iterable (e.g. HF streaming dataset).
+
+    Uses StreamingDocumentDataset internally. Never materializes the full
+    corpus in memory. Supports multi-worker sharding for parallel tokenization.
+    """
+    ds = StreamingDocumentDataset(
+        text_iterable=text_iterable,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        stride=stride,
+        min_tail_len=min_tail_len,
+        add_eos=add_eos,
+        text_column=text_column,
+        max_samples=max_samples,
+    )
+
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        collate_fn=_default_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=True,
+    )
+ 
