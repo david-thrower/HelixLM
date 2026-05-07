@@ -5,8 +5,8 @@ scripts/nas_helixlm.py
 Neural Architecture Search for HelixLM using Optuna.
 
 3-round escalation protocol:
-  Screening   : 20K samples, 2 epochs, ~80 trials, 5 parallel  -> eliminate losers
-  Validation  : 100K samples, 5 epochs, ~15 trials, 3 parallel -> confirm top configs
+  Screening   : 5K samples, 2 epochs, ~80 trials, 5 parallel  -> eliminate losers
+  Validation  : 50K samples, 5 epochs, ~15 trials, 3 parallel -> confirm top configs
   Final       : Full dataset, 10 epochs, 3 trials, 1 parallel  -> convergence
 
 Features:
@@ -17,6 +17,7 @@ Features:
       * grad_accum <= 2 for stability at high LR (3e-3+)
       * FP32 forced for seq_len <= 128 (FP16 overflows in short recurrent paths)
       * Native batch size preferred over grad_accum
+  - torch.compile flag: default OFF, only enables for static configs (n_loops<=2, no ACT)
 
 Usage:
   # Screening round (fast, many trials, 5 parallel on g6e.2xlarge spot)
@@ -27,6 +28,9 @@ Usage:
 
   # Final round (best config, full dataset, single A100)
   python scripts/nas_helixlm.py --round final --n-jobs 1 --seq-len 256
+
+  # With torch.compile (only for fixed-loop configs)
+  python scripts/nas_helixlm.py --round screening --compile
 
   # Cost-prediction study: search across all 3 seq_lens in one screening
   python scripts/nas_helixlm.py --round screening --search-seq-len --n-jobs 5
@@ -73,7 +77,7 @@ from helix_lm.nas_search_space import (
 # ---------------------------------------------------------------------------
 ROUNDS: Dict[str, Dict[str, Any]] = {
     "screening": {
-        "max_samples": 20000,
+        "max_samples": 5000,         # 5K samples for fast elimination
         "epochs": 2,
         "n_trials": 80,
         "n_parallel": 5,
@@ -81,7 +85,7 @@ ROUNDS: Dict[str, Dict[str, Any]] = {
         "instance_cost_hr": 1.52,
     },
     "validation": {
-        "max_samples": 100000,
+        "max_samples": 50000,      # 50K samples
         "epochs": 5,
         "n_trials": 15,
         "n_parallel": 3,
@@ -89,7 +93,7 @@ ROUNDS: Dict[str, Dict[str, Any]] = {
         "instance_cost_hr": 1.52,
     },
     "final": {
-        "max_samples": None,
+        "max_samples": None,       # full dataset
         "epochs": 10,
         "n_trials": 3,
         "n_parallel": 1,
@@ -98,7 +102,8 @@ ROUNDS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DATASET_REPO = "david-thrower/HelixLM-tiny-400.0Mt-730000pt-57143it-20260430"
+# Default to tiny dataset for fast screening
+DATASET_REPO = "david-thrower/HelixLM-tiny-5.0Mt-9125pt-715it-20260427"
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -123,6 +128,48 @@ def get_device() -> torch.device:
         return dev
     print("  WARNING: No CUDA available, falling back to CPU")
     return torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
+# torch.compile helper
+# ---------------------------------------------------------------------------
+def maybe_compile_model(model: torch.nn.Module, params: Dict[str, Any], compile_enabled: bool) -> torch.nn.Module:
+    """
+    Conditionally apply torch.compile based on HelixLM-specific safety rules.
+
+    Rules:
+    - Default: OFF (compile is harmful for dynamic recurrent graphs)
+    - Only compile if:
+        1. --compile flag is passed AND
+        2. n_loops <= 2 (shallow loops are more traceable) AND
+        3. ACT is disabled (fixed loop depth, static graph)
+    """
+    if not compile_enabled:
+        print("  [COMPILE] torch.compile disabled (default for HelixLM)")
+        return model
+
+    # Safety checks
+    if params["n_loops"] > 2:
+        print(f"  [COMPILE] SKIPPED: n_loops={params['n_loops']} > 2 (dynamic graph too deep)")
+        return model
+
+    # Check if ACT is enabled in the model config
+    # If the model has use_act or similar flag, we check it here
+    # For now, we assume ACT is enabled by default in HelixLM configs
+    # and only compile when explicitly disabled
+    has_act = getattr(model, "use_act", False) or getattr(model.cfg, "use_act", True)
+    if has_act:
+        print(f"  [COMPILE] SKIPPED: ACT halting enabled (dynamic loop depth)")
+        return model
+
+    # Check attention mode: full attention is more static than hybrid
+    if params["attention_mode"] == "hybrid" and params.get("hybrid_full_attention_interval", 2) <= 1:
+        print(f"  [COMPILE] SKIPPED: hybrid interval=1 (too much graph variation)")
+        return model
+
+    print(f"  [COMPILE] ENABLED: n_loops={params['n_loops']}, no ACT, mode={params['attention_mode']}")
+    compiled = torch.compile(model, mode="reduce-overhead")
+    return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +219,11 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         return float("inf")
 
     # -----------------------------------------------------------------------
+    # 3b. Conditionally apply torch.compile
+    # -----------------------------------------------------------------------
+    model = maybe_compile_model(model, params, args.compile)
+
+    # -----------------------------------------------------------------------
     # 4. MLflow run
     # -----------------------------------------------------------------------
     run_name = f"trial_{trial.number:03d}_seq{params['seq_len']}_d{params['d_model']}"
@@ -181,11 +233,12 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         mlflow.log_param("trial_number", trial.number)
         mlflow.log_param("param_count", param_count)
         mlflow.log_param("estimated_vram_mb", round(estimate_vram(params), 1))
+        mlflow.log_param("torch_compile", args.compile)
 
         cost_pred = estimate_training_cost(
             params,
-            dataset_tokens=400_000_000,
-            epochs=10,
+            dataset_tokens=5_000_000 if args.round == "screening" else 400_000_000,
+            epochs=round_cfg["epochs"],
             instance_cost_per_hour=round_cfg["instance_cost_hr"],
         )
         mlflow.log_params({f"cost_pred_{k}": str(v) for k, v in cost_pred.items()})
@@ -200,7 +253,7 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
               f"wd={params['weight_decay']}  eps={params['adam_eps']}")
         print(f"  params={param_count:,}  est_vram={estimate_vram(params):.0f}MB  "
               f"batch={params['batch_size']}  accum={params['grad_accum']}")
-        print(f"  est_full_cost=${cost_pred['estimated_cost_usd']}  "
+        print(f"  est_cost=${cost_pred['estimated_cost_usd']}  "
               f"est_wall={cost_pred['wall_days']} days")
         print(f"{'='*60}")
 
@@ -209,9 +262,9 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
         # -------------------------------------------------------------------
         try:
             train_max = round_cfg["max_samples"]
-            val_max = max(1000, train_max // 20) if train_max else 5000
-            train_texts = load_texts(DATASET_REPO, "pretrain_train", train_max)
-            val_texts = load_texts(DATASET_REPO, "pretrain_val", val_max)
+            val_max = max(500, train_max // 10) if train_max else 5000
+            train_texts = load_texts(args.dataset_repo, "pretrain_train", train_max)
+            val_texts = load_texts(args.dataset_repo, "pretrain_val", val_max)
         except Exception as e:
             warnings.warn(f"Data loading failed: {e}")
             mlflow.log_param("failed", "data_loading")
@@ -313,8 +366,8 @@ def objective(trial: optuna.Trial, args: argparse.Namespace, round_cfg: Dict[str
 
         actual_cost = estimate_training_cost(
             params,
-            dataset_tokens=400_000_000,
-            epochs=10,
+            dataset_tokens=5_000_000 if args.round == "screening" else 400_000_000,
+            epochs=round_cfg["epochs"],
             instance_cost_per_hour=round_cfg["instance_cost_hr"],
             tok_per_sec_assumed=avg_tok_per_sec,
         )
@@ -346,6 +399,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-repo", default=DATASET_REPO)
     parser.add_argument("--mlflow-uri", default=os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000"))
     parser.add_argument("--enqueue-top", type=int, default=None)
+    parser.add_argument("--compile", action="store_true",
+                        help="Enable torch.compile for static configs only (n_loops<=2, no ACT). Default: OFF.")
     return parser.parse_args()
 
 
@@ -406,6 +461,7 @@ def main() -> None:
     print(f" HELIXLM NAS — {args.round.upper()} ROUND")
     print(f" Trials: {n_trials}  |  Parallel: {n_jobs}  |  SeqLen: {'searched' if args.search_seq_len else args.seq_len}")
     print(f" Dataset: {args.dataset_repo}")
+    print(f" torch.compile: {'enabled (conditional)' if args.compile else 'disabled'}")
     print(f" Storage: {storage_path}")
     print(f"{'='*70}\n")
 
