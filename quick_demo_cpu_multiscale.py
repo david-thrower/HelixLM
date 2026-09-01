@@ -40,6 +40,7 @@ def main():
     # small_v2 defaults: d_model=256, n_heads=4
     # Scale windows to fit 96-length sequences
     cfg = HelixConfig.small_v2(
+        lr=1.5e-4,
         vocab_size=vocab_size,
         seq_len=MAX_SEQ_LEN,
         tokenizer_name="gpt2",
