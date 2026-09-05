@@ -685,6 +685,7 @@ in this handbook.
 | 2026-09-04 | David, Mo | ACTIVE | Multi-epoch runs require local periodic checkpoints and optional post-hash Hugging Face upload. | Resume claims require a stop-and-restore court. |
 | 2026-09-04 | Porthos, Mo | ACTIVE | MLflow is telemetry projection; local append-only evidence and checkpoints retain custody. | Revisit only if a durable bidirectional custody protocol is admitted. |
 | 2026-09-04 | Porthos, Mo | ACTIVE | Helix research does not block or authorize Thunderline Beta 1 runtime or checkpoint promotion. | Revisit through an explicit HC admission packet. |
+| 2026-09-05 | Porthos, Mo | EXPERIMENTAL | Preserve the exact Branch 62 anchor for every example; permit Trident supplemental paths and fusion only for uncertain examples; use whole-node structured gating on the RTX 5080. | Revisit after a fixed-checkpoint CUDA benchmark establishes oracle gain, positive net repair, and real wall-clock behavior. |
 
 ## 17. Run handoff template
 
@@ -737,3 +738,107 @@ NEXT_BOUNDED_ACTION=
 
 If any identity field is unknown, write UNAVAILABLE. Never backfill it from
 memory and call the packet exact.
+
+## 18. Adaptive structured compute and Trident
+
+Trident tests whether one shared Helix model can spend additional computation
+selectively instead of applying the same full multi-path budget to every
+example. It remains an experimental path and does not replace the canonical
+Branch 62 model or trainer.
+
+### Normative boundary
+
+```text
+anchor=
+exact Branch 62 model object
+always available
+always executed for every example
+never approximated by a lane adapter
+
+supplemental execution=
+uncertain examples only
+dense selected-example sub-batch
+complete graph-node selection
+
+exploration=
+conditional on a declared uncertainty policy
+
+fusion=
+uncertain examples only
+confident logits remain exact anchor logits
+
+RTX 5080 sparsity posture=
+whole-node structured gating only
+```
+
+Do not introduce irregular parameter, channel, attention-head, or activation-
+element masks on the RTX 5080 merely because they reduce nominal FLOPs. They
+require a separate matched benchmark proving improved wall-clock performance,
+preserved quality, and stable kernels against the whole-node baseline.
+
+The M0 uncertainty observation is normalized entropy at the final attended
+token. A threshold is part of the run contract. Per-example decisions may form
+a smaller dense sub-batch; they may not create elementwise sparse computation
+and describe it as GPU acceleration.
+
+### Truth posture
+
+`stability` and `exploration` are hypotheses about future learned behavior, not
+presently established cognitive properties. The M0 prototype selects
+complementary structural paths through the shared graph. Those names become
+earned only if fixed-evaluator evidence shows complementary errors and useful
+repair.
+
+Because the anchor always runs, adaptive Trident is not expected to outperform
+the anchor's raw throughput. Its first performance comparison is against an
+always-on three-path system. Its first scientific question is whether selective
+supplemental compute improves quality enough to justify its average cost.
+
+### Required experiment
+
+Freeze one checkpoint, sample order, evaluator, and scoring contract. Compare:
+
+```text
+A. exact Branch 62 anchor
+B. always-on three-path Trident
+C. adaptive whole-node Trident
+```
+
+Required measurements:
+
+```text
+oracle gain
+fusion repair rate
+fusion harm rate
+net repair
+error correlation and calibration
+supplemental-example rate
+validation and downstream quality
+causal targets per second
+latency p50/p95
+executed node calls
+GPU utilization, power, and VRAM
+active and total parameters
+```
+
+Stop if the supplemental paths show no oracle gain, fusion has non-positive net
+repair, confident output drifts from the anchor, or the structured scheduler
+does not reduce measured cost relative to always-on Trident. A positive result
+authorizes a specialization-training design; it does not itself admit Trident
+into the production model.
+
+### Current executable evidence
+
+The isolated M0 prototype is bound to:
+
+```text
+branch=experiment/helix-trident-rule30-m0
+commit=8864b5d48f2c67d53d21cf7fb7a7643d86787951
+tree=e63446ec1e4c89da740e7ebe08250a157e51e712
+hostile_courts=18 PASS
+cpu_smoke=PASS
+anchor_max_abs_diff=0.0
+bypassed_original_node_calls=zero
+gpu_benchmark=NOT_RUN
+training_specialization=NOT_ESTABLISHED
+```
