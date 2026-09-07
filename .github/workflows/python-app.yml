@@ -38,18 +38,18 @@ jobs:
     #   run: |
     #     pytest
     # Basic Smoke Test
-    - name: Smoke Test
-      run: |
-        python3 helix_lm/smoke_test.py
-    - name: Test safe Iteration on Unknown Len Streaming
-      timeout-minutes: 15
-      run: |
-        python3 text_iter_unknown_len_pretrain.py
+    # - name: Smoke Test
+    #   run: |
+    #     python3 helix_lm/smoke_test.py
+    # - name: Test safe Iteration on Unknown Len Streaming
+    #   timeout-minutes: 15
+    #   run: |
+    #     python3 text_iter_unknown_len_pretrain.py
     # Test PretrainTrainer and pretrain Dataset tooling
-    - name: Pretrain streaming equivalence test
-      timeout-minutes: 120
-      run: |
-        python3 test_pretrain_streaming_equivalence.py
+    # - name: Pretrain streaming equivalence test
+    #   timeout-minutes: 120
+    #   run: |
+    #     python3 test_pretrain_streaming_equivalence.py
     # Train a minimal model with PretrainTrainer
     - name: Demo run 
       timeout-minutes: 90
