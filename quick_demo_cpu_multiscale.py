@@ -22,6 +22,10 @@ MAX_SEQ_LEN = 96
 NUM_SAMPLES = 2600
 VAL_SPLIT = 0.2
 
+D_MODEL = 384
+N_HEADS = D_MODEL // 64
+CORRECTOR_DIM = D_MODEL // 2
+
 EXAMPLE_PROMPTS = [
     "The next day, something unexpected",
     "I have an idea, Ben. Let\'s build a",
@@ -45,13 +49,15 @@ def main():
         seq_len=MAX_SEQ_LEN,
         tokenizer_name="gpt2",
         use_titans_memory=False,
+        d_model=D_MODEL,
+        n_heads=N_HEADS,
         n_loops=3,
         attention_mode="multi_scale_windowed",
         local_window=32,
         coarse_window=48,
         compressed_windows=16,
         compressed_views=8,
-        corrector_dim=128,      # d_model // 2
+        corrector_dim=CORRECTOR_DIM,      # d_model // 2
         consensus_type="cosine",
         corrector_type="ffn",
         dropout=0.1,
