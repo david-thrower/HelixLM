@@ -34,22 +34,22 @@ jobs:
         flake8 . --ignore=C901 --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    # - name: Test with pytest
-    #   run: |
-    #     pytest
+    - name: Test with pytest
+      run: |
+        pytest
     # Basic Smoke Test
-    # - name: Smoke Test
-    #   run: |
-    #     python3 helix_lm/smoke_test.py
-    # - name: Test safe Iteration on Unknown Len Streaming
-    #   timeout-minutes: 15
-    #   run: |
-    #     python3 text_iter_unknown_len_pretrain.py
-    # # Test PretrainTrainer and pretrain Dataset tooling
-    # - name: Pretrain streaming equivalence test
-    #   timeout-minutes: 120
-    #   run: |
-    #     python3 test_pretrain_streaming_equivalence.py
+    - name: Smoke Test
+      run: |
+        python3 helix_lm/smoke_test.py
+    - name: Test safe Iteration on Unknown Len Streaming
+      timeout-minutes: 15
+      run: |
+        python3 text_iter_unknown_len_pretrain.py
+    # Test PretrainTrainer and pretrain Dataset tooling
+    - name: Pretrain streaming equivalence test
+      timeout-minutes: 120
+      run: |
+        python3 test_pretrain_streaming_equivalence.py
     # Train a minimal model with PretrainTrainer
     - name: Demo run 
       timeout-minutes: 90
