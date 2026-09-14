@@ -46,6 +46,7 @@ def main():
         tokenizer_name="gpt2",
         use_titans_memory=False,
         n_loops=3,
+        n_columns=3,
         attention_mode="multi_scale_windowed",
         local_window=32,
         coarse_window=48,
