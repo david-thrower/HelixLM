@@ -18,8 +18,9 @@ import warnings
 import tempfile
 import hashlib
 import json
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any, Union, Callable
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -659,7 +660,7 @@ class PretrainTrainer(Trainer):
             training epoch to obtain the total number of batches. This enables an exact
             progress bar from epoch 1. If False, the count is learned after epoch 1.
     """
-    TRAINING_STATE_VERSION = "helix.pretrain.training-state.v2"
+    TRAINING_STATE_VERSION = "helix.pretrain.training-state.v3"
     TRAINING_STATE_FIELDS = frozenset(
         {
             "epoch",
@@ -671,6 +672,8 @@ class PretrainTrainer(Trainer):
             "permutation_epoch",
             "permutation_seed",
             "validation_source_root",
+            "validation_sample_ids",
+            "validation_sample_ids_sha256",
             "model",
             "optimizer",
             "best_val_loss",
@@ -745,7 +748,14 @@ class PretrainTrainer(Trainer):
         seed=42,
         num_workers=0,
         total_optimizer_steps=None,
+        max_optimizer_steps=None,
         min_lr_ratio=1.0,
+        checkpoint_every_steps=None,
+        checkpoint_slots: int = 2,
+        step_callback: Optional[Callable[[Dict[str, float]], None]] = None,
+        eval_every_steps=None,
+        validation_batches=None,
+        evaluation_callback: Optional[Callable[[Dict[str, float]], None]] = None,
         count_first: bool = False,
         train_store_dir=None,
         pretrain_store_dir=None,
@@ -753,6 +763,9 @@ class PretrainTrainer(Trainer):
         train_permutation_epoch: int = 0,
         train_cursor: int = 0,
         resume_training_state=None,
+        validation_sample_count: int = 0,
+        validation_sample_ids=None,
+        pretrain_source: Optional[Dict[str, Any]] = None,
         verify_train_store: bool = True,
         pin_memory: bool = True,
         prefetch_factor: int = 4,
@@ -795,7 +808,7 @@ class PretrainTrainer(Trainer):
                     store_dir=store_dir,
                     tokenizer=tokenizer,
                     seq_len=cfg.seq_len,
-                    source={"auto": "true"},
+                    source=dict(pretrain_source or {"auto": "true"}),
                     verify=verify_train_store,
                 )
                 train_store_dir = store_dir
@@ -837,12 +850,22 @@ class PretrainTrainer(Trainer):
             val_texts=val_texts,
             val_store_dir=val_store_dir,
         )
+        self._validation_sample_ids = tuple()
+        self._validation_sample_ids_sha256 = None
 
         if self._indexed_train:
             self._train_dataset = PretrainIndexedDataset(
                 train_store_dir,
                 verify=verify_train_store,
             )
+            if pretrain_source:
+                stored_source = self._train_dataset.manifest.value.get("source", {})
+                for key, value in pretrain_source.items():
+                    if stored_source.get(key) != value:
+                        raise ValueError(
+                            f"Source identity mismatch for key '{key}': "
+                            f"stored {stored_source.get(key)!r} != requested {value!r}"
+                        )
             if self._train_dataset.seq_len != cfg.seq_len:
                 raise ValueError(
                     "Compiled pretraining seq_len does not match the model config: "
@@ -868,18 +891,66 @@ class PretrainTrainer(Trainer):
                 expected_epoch=train_permutation_epoch,
                 expected_seed=seed,
             )
+            if resume_state is not None and validation_sample_ids is None:
+                validation_sample_ids = resume_state["validation_sample_ids"]
+            if validation_sample_ids is not None:
+                resolved_validation_ids = tuple(int(value) for value in validation_sample_ids)
+                if validation_sample_count not in (0, len(resolved_validation_ids)):
+                    raise ValueError(
+                        "validation_sample_count does not match validation_sample_ids"
+                    )
+            elif validation_sample_count:
+                validation_sample_count = int(validation_sample_count)
+                if validation_sample_count <= 0:
+                    raise ValueError("validation_sample_count must be non-negative")
+                if validation_sample_count >= len(self._train_dataset):
+                    raise ValueError(
+                        "validation_sample_count must leave at least one training sample"
+                    )
+                resolved_validation_ids = tuple(
+                    int(value)
+                    for value in self._train_permutation.values()[
+                        len(self._train_dataset) - validation_sample_count :
+                    ]
+                )
+            else:
+                resolved_validation_ids = tuple()
+            if len(set(resolved_validation_ids)) != len(resolved_validation_ids):
+                raise ValueError("validation_sample_ids must be unique")
+            if any(
+                sample_id < 0 or sample_id >= len(self._train_dataset)
+                for sample_id in resolved_validation_ids
+            ):
+                raise ValueError("validation_sample_ids contains an out-of-range sample")
+            self._validation_sample_ids = resolved_validation_ids
+            if resolved_validation_ids:
+                validation_id_bytes = np.asarray(
+                    resolved_validation_ids,
+                    dtype=np.dtype("<u4"),
+                ).tobytes(order="C")
+                self._validation_sample_ids_sha256 = hashlib.sha256(
+                    validation_id_bytes
+                ).hexdigest()
+                self._validation_source_root = (
+                    "indexed-permutation-tail:"
+                    + self._validation_sample_ids_sha256
+                )
             self.train_loader = create_pretrain_indexed_loader(
                 self._train_dataset,
                 self._train_permutation,
                 cfg.batch_size,
                 cursor=self._train_cursor,
+                excluded_sample_ids=self._validation_sample_ids,
                 num_workers=num_workers,
                 drop_last=True,
                 pin_memory=pin_memory,
                 prefetch_factor=prefetch_factor,
             )
+            available_training_samples = (
+                len(self._train_dataset) - len(self._validation_sample_ids)
+            )
             self._usable_sample_count = (
-                len(self._train_dataset) // int(cfg.batch_size)
+                available_training_samples // int(cfg.batch_size)
             ) * int(cfg.batch_size)
             if self._train_cursor < 0 or self._train_cursor > self._usable_sample_count:
                 raise ValueError("Indexed pretraining cursor is outside the usable sample range")
@@ -922,6 +993,22 @@ class PretrainTrainer(Trainer):
                 num_workers=int(num_workers),
                 pin_memory=bool(pin_memory and torch.cuda.is_available()),
             )
+        elif self._indexed_train and self._validation_sample_ids:
+            from torch.utils.data import Subset
+
+            val_dataset = Subset(
+                self._train_dataset,
+                list(self._validation_sample_ids),
+            )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=int(cfg.batch_size),
+                shuffle=False,
+                drop_last=False,
+                collate_fn=collate_pretrain_samples,
+                num_workers=int(num_workers),
+                pin_memory=bool(pin_memory and torch.cuda.is_available()),
+            )
         elif val_texts is not None:
             # Always use ContinuousWindowDataset for validation; it works for
             # both materialized and streaming inputs without __len__ issues.
@@ -955,6 +1042,33 @@ class PretrainTrainer(Trainer):
         self._val_shard_dir = None
 
         self.total_optimizer_steps = total_optimizer_steps
+        self.max_optimizer_steps = (
+            int(max_optimizer_steps) if max_optimizer_steps is not None else None
+        )
+        if self.max_optimizer_steps is not None and self.max_optimizer_steps <= 0:
+            raise ValueError("max_optimizer_steps must be positive")
+        self.checkpoint_every_steps = (
+            int(checkpoint_every_steps)
+            if checkpoint_every_steps is not None
+            else None
+        )
+        if self.checkpoint_every_steps is not None and self.checkpoint_every_steps <= 0:
+            raise ValueError("checkpoint_every_steps must be positive")
+        self.checkpoint_slots = int(checkpoint_slots)
+        if self.checkpoint_slots <= 0:
+            raise ValueError("checkpoint_slots must be positive")
+        self.step_callback = step_callback
+        self.eval_every_steps = (
+            int(eval_every_steps) if eval_every_steps is not None else None
+        )
+        if self.eval_every_steps is not None and self.eval_every_steps <= 0:
+            raise ValueError("eval_every_steps must be positive")
+        self.validation_batches = (
+            int(validation_batches) if validation_batches is not None else None
+        )
+        if self.validation_batches is not None and self.validation_batches <= 0:
+            raise ValueError("validation_batches must be positive")
+        self.evaluation_callback = evaluation_callback
         self._scheduler_min_lr = min_lr_ratio if total_optimizer_steps is not None else 1.0
 
         self.count_first = count_first
@@ -978,6 +1092,11 @@ class PretrainTrainer(Trainer):
                 raise ValueError("Indexed pretraining checkpoint permutation mismatch")
             if resume_state["validation_source_root"] != self._validation_source_root:
                 raise ValueError("Indexed pretraining checkpoint validation source mismatch")
+            if (
+                resume_state["validation_sample_ids_sha256"]
+                != self._validation_sample_ids_sha256
+            ):
+                raise ValueError("Indexed pretraining checkpoint validation identity mismatch")
             self.model.load_state_dict(resume_state["model"])
             self.optimizer.load_state_dict(resume_state["optimizer"])
             self.global_step = int(resume_state["global_step"])
@@ -1155,6 +1274,10 @@ class PretrainTrainer(Trainer):
             "use_amp": bool(self.use_amp),
             "amp_dtype": str(self.amp_dtype),
             "device_type": self.device.type,
+            "max_optimizer_steps": self.max_optimizer_steps,
+            "checkpoint_every_steps": self.checkpoint_every_steps,
+            "eval_every_steps": self.eval_every_steps,
+            "validation_batches": self.validation_batches,
         }
 
     @staticmethod
@@ -1213,6 +1336,7 @@ class PretrainTrainer(Trainer):
             permutation,
             self.cfg.batch_size,
             cursor=self._train_cursor,
+            excluded_sample_ids=self._validation_sample_ids,
             num_workers=self._indexed_num_workers,
             drop_last=True,
             pin_memory=self._indexed_pin_memory,
@@ -1258,6 +1382,12 @@ class PretrainTrainer(Trainer):
         skipped_batches = 0
         epoch_start = time.time()
         tokens_seen = 0
+        causal_targets_seen = 0
+        group_loss_weighted = 0.0
+        group_targets = 0
+        group_started = time.perf_counter()
+        step_limit_reached = False
+        batch_idx = -1
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -1284,6 +1414,12 @@ class PretrainTrainer(Trainer):
         )
 
         for batch_idx, batch in enumerate(pbar):
+            if (
+                self.max_optimizer_steps is not None
+                and self.global_step >= self.max_optimizer_steps
+            ):
+                step_limit_reached = True
+                break
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
             if self._indexed_train:
@@ -1328,11 +1464,85 @@ class PretrainTrainer(Trainer):
             total_loss += loss.item()
             raw_count += 1
             tokens_seen += input_ids.numel()
+            causal_targets = int((labels[:, 1:] != -100).sum().item())
+            causal_targets_seen += causal_targets
+            group_targets += causal_targets
+            group_loss_weighted += float(loss.detach()) * causal_targets
 
             # Optimizer step after accumulation
             if accum_count == self.grad_accum_steps:
-                self._step(accum_count)
+                lr = float(self.optimizer.param_groups[0]["lr"])
+                grad_norm = self._step(accum_count)
+                step_seconds = time.perf_counter() - group_started
+                elapsed = max(time.time() - epoch_start, 1e-6)
+                if self.step_callback is not None:
+                    self.step_callback(
+                        {
+                            "global_step": float(self.global_step),
+                            "loss": group_loss_weighted / max(group_targets, 1),
+                            "perplexity": compute_perplexity(
+                                group_loss_weighted / max(group_targets, 1)
+                            ),
+                            "lr": lr,
+                            "grad_norm": grad_norm,
+                            "step_seconds": step_seconds,
+                            "causal_targets_step": float(group_targets),
+                            "causal_targets_total": float(causal_targets_seen),
+                            "causal_targets_per_second_step": (
+                                group_targets / max(step_seconds, 1e-6)
+                            ),
+                            "causal_targets_per_second_session": (
+                                causal_targets_seen / elapsed
+                            ),
+                            "tokens_total": float(tokens_seen),
+                            "sample_cursor": float(self._train_cursor),
+                            "skipped_batches": float(skipped_batches),
+                            "vram_allocated_bytes": float(
+                                torch.cuda.memory_allocated()
+                                if self.device.type == "cuda"
+                                else 0
+                            ),
+                            "vram_reserved_bytes": float(
+                                torch.cuda.memory_reserved()
+                                if self.device.type == "cuda"
+                                else 0
+                            ),
+                            "peak_vram_bytes": float(
+                                torch.cuda.max_memory_allocated()
+                                if self.device.type == "cuda"
+                                else 0
+                            ),
+                        }
+                    )
+                if (
+                    self.checkpoint_every_steps is not None
+                    and self.global_step % self.checkpoint_every_steps == 0
+                ):
+                    slot = (
+                        self.global_step // self.checkpoint_every_steps
+                    ) % self.checkpoint_slots
+                    self.save_checkpoint(epoch, f"latest-{slot}")
+                if (
+                    self.val_loader is not None
+                    and self.eval_every_steps is not None
+                    and self.global_step % self.eval_every_steps == 0
+                ):
+                    validation_metrics = self.evaluate(
+                        max_batches=self.validation_batches
+                    )
+                    self.model.train()
+                    if self.evaluation_callback is not None:
+                        self.evaluation_callback(validation_metrics)
                 accum_count = 0
+                group_loss_weighted = 0.0
+                group_targets = 0
+                group_started = time.perf_counter()
+                if (
+                    self.max_optimizer_steps is not None
+                    and self.global_step >= self.max_optimizer_steps
+                ):
+                    step_limit_reached = True
+                    break
 
             # Progress bar update
             avg = total_loss / max(raw_count, 1)
@@ -1347,12 +1557,12 @@ class PretrainTrainer(Trainer):
             })
 
         # End of epoch: handle leftover accumulation (partial group)
-        if accum_count > 0:
+        if accum_count > 0 and not step_limit_reached:
             self._step(accum_count)
 
         # After first epoch, store actual batch count
         if self._known_train_batches is None:
-            self._known_train_batches = batch_idx + 1
+            self._known_train_batches = max(batch_idx + 1, 0)
 
         avg_loss = total_loss / max(raw_count, 1)
         return {
@@ -1360,6 +1570,8 @@ class PretrainTrainer(Trainer):
             "perplexity": compute_perplexity(avg_loss),
             "time": time.time() - epoch_start,
             "skipped_batches": skipped_batches,
+            "causal_targets": causal_targets_seen,
+            "step_limit_reached": step_limit_reached,
         }
 
     def save_checkpoint(self, epoch: int, filename: Optional[str] = None):
@@ -1380,6 +1592,8 @@ class PretrainTrainer(Trainer):
             "permutation_epoch": int(self._train_permutation.metadata["epoch"]),
             "permutation_seed": int(self._train_permutation.metadata["seed"]),
             "validation_source_root": self._validation_source_root,
+            "validation_sample_ids": list(self._validation_sample_ids),
+            "validation_sample_ids_sha256": self._validation_sample_ids_sha256,
         }
         path = os.path.join(checkpoint_dir, "pretrain_data_state.json")
         with open(path + ".tmp", "w", encoding="utf-8") as handle:
@@ -1407,7 +1621,7 @@ class PretrainTrainer(Trainer):
         torch.save(training_state, training_state_path + ".tmp")
         os.replace(training_state_path + ".tmp", training_state_path)
 
-    def evaluate(self) -> Dict[str, float]:
+    def evaluate(self, max_batches: Optional[int] = None) -> Dict[str, float]:
         """
         Override evaluate to avoid len(self.val_loader) (IterableDataset has no len).
         Uses token-weighted averaging and a tqdm progress bar.
@@ -1418,7 +1632,9 @@ class PretrainTrainer(Trainer):
         self.model.eval()
         total_loss = 0.0
         total_tokens = 0
+        total_samples = 0
         num_batches = 0
+        batch_idx = -1
 
         # Determine total batches for progress bar (None if unknown)
         total_batches = self._known_val_batches
@@ -1433,6 +1649,8 @@ class PretrainTrainer(Trainer):
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(pbar):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
                 attention_mask = batch.get("attention_mask")
@@ -1447,9 +1665,10 @@ class PretrainTrainer(Trainer):
 
                 loss = outputs["loss"]
                 if not (torch.isnan(loss) or torch.isinf(loss)):
-                    valid_tokens = (labels != -100).sum().item()
+                    valid_tokens = (labels[:, 1:] != -100).sum().item()
                     total_loss += loss.item() * valid_tokens
                     total_tokens += valid_tokens
+                    total_samples += int(input_ids.shape[0])
                     num_batches += 1
 
                 # Update progress bar
@@ -1461,13 +1680,14 @@ class PretrainTrainer(Trainer):
 
         # Store actual batch count for future evaluations
         if self._known_val_batches is None:
-            self._known_val_batches = batch_idx + 1
+            self._known_val_batches = max(batch_idx + 1, 0)
 
         avg_loss = total_loss / max(total_tokens, 1)
         return {
             "loss": avg_loss,
             "perplexity": compute_perplexity(avg_loss),
-            "total_tokens": total_tokens,
+            "causal_targets": total_tokens,
+            "sample_count": total_samples,
         }
 
     def _step(self, group_size: int):
@@ -1482,7 +1702,10 @@ class PretrainTrainer(Trainer):
             if param.grad is not None:
                 param.grad.div_(group_size)
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            self.cfg.grad_clip,
+        )
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
@@ -1493,6 +1716,7 @@ class PretrainTrainer(Trainer):
         self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
+        return float(grad_norm)
 
     def train(self, num_epochs: Optional[int] = None, eval_every: int = 1) -> Dict[str, Any]:
         """
@@ -1515,7 +1739,9 @@ class PretrainTrainer(Trainer):
             print(f"LR: {self.cfg.lr} | AMP: {self.use_amp}")
             print(f"{'='*60}\n")
 
+        final_epoch = start_epoch
         for epoch in range(start_epoch, epochs + 1):
+            final_epoch = epoch
             if self.verbose:
                 print(f"\nEpoch {epoch}/{epochs}")
                 print("-" * 40)
@@ -1563,7 +1789,10 @@ class PretrainTrainer(Trainer):
                             print(f"  '{prompt}' -> [Error: {e}]")
                 print()
 
-        self.save_checkpoint(epochs, "final_model")
+            if train_metrics.get("step_limit_reached"):
+                break
+
+        self.save_checkpoint(final_epoch, "final_model")
         if self.verbose:
             print(f"\nTraining complete!")
         return self.history
