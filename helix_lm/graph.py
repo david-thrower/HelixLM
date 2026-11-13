@@ -96,6 +96,16 @@ class HelixGraph(nn.Module):
 
             self.graph[name] = preds
 
+        # Size gate mixing weights from the ACTUAL wiring. n_preds=len(column)
+        # from _build_node_spec is only a guess: random vertical/lateral draws
+        # can leave a gate with a single predecessor (softmax over one logit is
+        # identically 1 -> dead weights) or with more predecessors than n_preds
+        # (weights[:n] truncation silently dropped the extras via zip).
+        for name, preds in self.graph.items():
+            node = self.nodes[name]
+            if isinstance(node, GateNode):
+                node.set_n_preds(max(1, len(preds)))
+
         # Merge layers for multi-predecessor non-gate nodes
         self.merges = nn.ModuleDict()
         self.merge_norms = nn.ModuleDict()
