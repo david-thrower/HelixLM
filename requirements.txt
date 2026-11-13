@@ -1,4 +1,4 @@
-torch==2.12.0
+torch==2.15.0
 transformers==5.8.1
 datasets==4.8.5
 tiktoken>=0.13.0
