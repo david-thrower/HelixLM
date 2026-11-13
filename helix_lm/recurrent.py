@@ -93,7 +93,15 @@ class HelixRecurrentBlock(nn.Module):
 
             still = ~halted
             rem = (1.0 - cum_p).clamp(min=0)
-            weight = torch.where(cum_p + p >= self.cfg.act_threshold, rem, p)
+            if t == self.cfg.n_loops - 1:
+                # Standard ACT: on the final loop, assign the remainder so every
+                # token's weights sum to exactly 1. Without this, tokens that
+                # never reach the threshold keep total weight cum_p < 1 and
+                # their output is silently scaled down (magnitude depends on
+                # n_loops).
+                weight = rem
+            else:
+                weight = torch.where(cum_p + p >= self.cfg.act_threshold, rem, p)
             weight = weight * still.float()
             h_out = h_out + weight.unsqueeze(-1) * h
             cum_p = cum_p + p * still.float()
