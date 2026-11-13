@@ -270,10 +270,11 @@ class Trainer:
             betas=(0.9, 0.999),
         )
 
-        # Scheduler steps count optimizer steps, not raw batches
-        # DEFERRED: avoid len() on lazy datasets to prevent eager chunking at init time.
-        # The scheduler is built on the first train_epoch() call when length is known.
-        self._scheduler_warmup = max(1, cfg.warmup_steps // self.grad_accum_steps)
+        # Scheduler steps count optimizer steps, not raw batches.
+        # cfg.warmup_steps is therefore expressed in OPTIMIZER steps. Dividing it by
+        # grad_accum_steps here silently quartered the warmup for every launcher that
+        # already passed optimizer steps (the released IT config: 172 -> 43).
+        self._scheduler_warmup = max(1, cfg.warmup_steps)
         self._scheduler_cycles = 0.5
         self._scheduler_min_lr = 0.1
         self.scheduler = None

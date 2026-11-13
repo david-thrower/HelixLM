@@ -99,6 +99,7 @@ class HelixConfig(PretrainedConfig):
         vertical_depth: int = 2,
         vertical_p: float = 0.7,
         gate_sinkhorn_iters: int = 5,
+        honor_nodes_per_column: bool = False,   # build exactly nodes_per_column[i] processing nodes
 
         # --- FFN ---
         ffn_expansion: float = 2.0,
@@ -241,6 +242,7 @@ class HelixConfig(PretrainedConfig):
         self.vertical_depth = vertical_depth
         self.vertical_p = vertical_p
         self.gate_sinkhorn_iters = gate_sinkhorn_iters
+        self.honor_nodes_per_column = honor_nodes_per_column
 
         # --- FFN ---
         self.ffn_expansion = ffn_expansion

@@ -168,6 +168,8 @@ class HelixGraph(nn.Module):
                     "dropout": cfg.dropout,
                     "attn_dropout": attn_drop,
                     "strict_nan_check": getattr(cfg, "strict_nan_check", False),
+                    "use_rope": getattr(cfg, "use_rope", False),
+                    "rope_theta": getattr(cfg, "rope_theta", 10000.0),
                     # Issue 6: output_ffn_dim intentionally NOT passed.
                 }))
             elif use_full_attn:
@@ -183,9 +185,19 @@ class HelixGraph(nn.Module):
                     "attn_dropout": attn_drop,
                 }))
 
-            column.append(("swiglu", {
-                "d_model": cfg.d_model, "expansion": cfg.ffn_expansion, "dropout": cfg.dropout,
-            }))
+            if getattr(cfg, "honor_nodes_per_column", False):
+                if cfg.use_ssm or cfg.use_titans_memory:
+                    raise ValueError(
+                        "honor_nodes_per_column=True fixes the node count per column; "
+                        "disable use_ssm/use_titans_memory or turn the flag off")
+                # attention counts as one processing node, the rest are SwiGLU
+                n_ffn = max(1, int(cfg.nodes_per_column[ci]) - 1)
+            else:
+                n_ffn = 1
+            for _ in range(n_ffn):
+                column.append(("swiglu", {
+                    "d_model": cfg.d_model, "expansion": cfg.ffn_expansion, "dropout": cfg.dropout,
+                }))
 
             if cfg.use_ssm:
                 if hasattr(cfg, 'ssm_d_state') and cfg.ssm_d_state >= 64:

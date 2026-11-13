@@ -19,6 +19,25 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Any
 
 
+def apply_rotary(x: torch.Tensor, positions: torch.Tensor, theta: float = 10000.0) -> torch.Tensor:
+    """RoPE for [N, H, L, Dh] using per-token absolute positions [N, L].
+
+    Rotating q and k by their absolute position makes attention depend on the
+    relative offset only, which is what the architecture's README claims and
+    what was previously missing: freqs_cis was computed and never used.
+    """
+    _, _, _, dh = x.shape
+    if dh % 2 != 0:
+        return x
+    half = dh // 2
+    freqs = 1.0 / (theta ** (torch.arange(0, half, device=x.device, dtype=torch.float32) / half))
+    angles = positions.to(torch.float32).unsqueeze(-1) * freqs.view(1, 1, -1)
+    cos = angles.cos().unsqueeze(1)
+    sin = angles.sin().unsqueeze(1)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -79,6 +98,8 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         strict_nan_check: bool = False,       # Issue 1: raise on corrupt NaN
+        use_rope: bool = False,               # apply RoPE to q/k in every attention path
+        rope_theta: float = 10000.0,
         # Deprecated: kept for config compatibility, ignored.
         output_ffn_dim: Optional[int] = None,
     ):
@@ -112,6 +133,8 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
 
         # Issue 1: strict NaN detection is opt-in (default: non-raising, training-stable)
         self.strict_nan_check = bool(strict_nan_check)
+        self.use_rope = bool(use_rope)
+        self.rope_theta = float(rope_theta)
 
         # Layer 1: shared QKV + output projection for local/coarse windowed attention
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
@@ -188,13 +211,17 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
     # ------------------------------------------------------------------
     # Safe causal masked attention (shared by windowed, compressed, corrector)
     # ------------------------------------------------------------------
-    def _project_qkv(self, x: torch.Tensor, qkv_proj: nn.Linear, n_heads: int, head_dim: int):
+    def _project_qkv(self, x: torch.Tensor, qkv_proj: nn.Linear, n_heads: int, head_dim: int,
+                     positions: Optional[torch.Tensor] = None):
         N, L, _ = x.shape
         qkv = qkv_proj(x).view(N, L, 3, n_heads, head_dim)
         q, k, v = qkv.unbind(2)
         q = q.transpose(1, 2).contiguous()  # [N, H, L, Dh]
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
+        if positions is not None:
+            q = apply_rotary(q, positions, self.rope_theta)
+            k = apply_rotary(k, positions, self.rope_theta)
         return q, k, v
 
     def _safe_attention(self, q, k, v, causal_allowed, key_valid, query_valid):
@@ -287,7 +314,14 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         xw = x_pad.reshape(B, nwin, win, D).reshape(B * nwin, win, D)
         xw = torch.where(mask_win.unsqueeze(-1), xw, torch.zeros_like(xw))
 
-        q, k, v = self._project_qkv(xw, self.qkv_proj, self.n_heads, self.head_dim)
+        if self.use_rope:
+            starts = torch.arange(nwin, device=x.device) * win
+            pos = starts.view(1, nwin, 1) + torch.arange(win, device=x.device).view(1, 1, win)
+            pos = pos.expand(B, nwin, win).reshape(B * nwin, win)
+        else:
+            pos = None
+        q, k, v = self._project_qkv(xw, self.qkv_proj, self.n_heads, self.head_dim,
+                                    positions=pos)
         causal = torch.tril(torch.ones(win, win, device=x.device, dtype=torch.bool))
 
         out = self._safe_attention(q, k, v, causal, mask_win, mask_win)  # [B*nwin, H, win, Dh]
@@ -375,8 +409,10 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
             z_comp, comp_valid = self._causal_prefix_compress(z, valid, boundaries)  # [B, K, Dc]
 
             # Causal attention over K compressed positions.
+            pos = boundaries.unsqueeze(0).expand(B, K) if self.use_rope else None
             q, k, vv = self._project_qkv(z_comp, self.view_qkv[v],
-                                        self.compressed_heads, self.compressed_head_dim)
+                                        self.compressed_heads, self.compressed_head_dim,
+                                        positions=pos)
             out_c = self._safe_attention(q, k, vv, causal_K, comp_valid, comp_valid)
             out_c = out_c.transpose(1, 2).reshape(B, K, self.compressed_dim)
             out_c = self.view_out[v](out_c)                       # [B, K, Dc]
@@ -448,8 +484,10 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         if self.corrector_type == "ffn":
             delta = self.corrector(corrector_input)
         else:  # attn (now causal + mask-aware)
+            cpos = (torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+                    if self.use_rope else None)
             q, k, v = self._project_qkv(consensus, self.corrector_qkv,
-                                       self.n_heads, self.head_dim)
+                                       self.n_heads, self.head_dim, positions=cpos)
             causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
             if attention_mask is not None:
                 cvalid = attention_mask.to(dtype=torch.bool, device=x.device)
