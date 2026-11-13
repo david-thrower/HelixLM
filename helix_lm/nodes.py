@@ -529,6 +529,14 @@ class LinearAttnNode(HeteroNode):
                                             self.k_feat.bias.float() if self.k_feat.bias is not None else None))
         v_fp32 = v.float()
 
+        # NaN/Inf isolation: a single contaminated position would otherwise
+        # spread through the prefix scans (kv_cum and z below) to EVERY later
+        # position in the sequence. Zero the bad position's contribution
+        # instead of poisoning the suffix. Positions before it stay exact.
+        q_fp32 = torch.nan_to_num(q_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+        k_fp32 = torch.nan_to_num(k_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+        v_fp32 = torch.nan_to_num(v_fp32, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Apply attention mask: zero out k,v contributions from pad positions
         if attention_mask is not None:
             mask = attention_mask.unsqueeze(1).unsqueeze(-1).float()  # (B, 1, T, 1)
@@ -728,14 +736,36 @@ class Mamba2Node(HeteroNode):
 
 
 class GateNode(HeteroNode):
-    """Aggregation node with learned softmax weighted sum."""
+    """Aggregation node with learned softmax weighted sum.
+
+    Dead-parameter fixes:
+      - forward() now applies self.norm (previously built by HeteroNode but
+        never used, so every gate's norm.weight received grad=None).
+      - A single-predecessor gate is a pure pass-through: softmax over one
+        logit is identically 1, so its mixing weights could never receive
+        gradient. HelixGraph calls set_n_preds() with the ACTUAL predecessor
+        count after wiring; with <= 1 predecessor the weights parameter is
+        removed instead of left dead. This also closes the opposite hazard:
+        when actual predecessors exceeded n_preds, weights[:n] truncated and
+        zip() silently dropped the extra predecessors.
+    """
     def __init__(self, d_model: int, n_preds: int = 2, dropout: float = 0.0):
         super().__init__(d_model)
         self.n_preds = n_preds
-        self.weights = nn.Parameter(torch.ones(n_preds) / n_preds)
+        self.weights = nn.Parameter(torch.ones(n_preds) / n_preds) if n_preds > 1 else None
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
         nn.init.xavier_uniform_(self.out_proj.weight)
+
+    def set_n_preds(self, n_preds: int):
+        """Re-size (or remove) mixing weights to match the actual wiring."""
+        self.n_preds = n_preds
+        if n_preds > 1:
+            self.weights = nn.Parameter(
+                torch.ones(n_preds, device=self.out_proj.weight.device) / n_preds
+            )
+        else:
+            self.weights = None  # single-predecessor pass-through, no dead param
 
     def forward(self, x_list, state: Any = None, cache: Any = None, attention_mask: Optional[torch.Tensor] = None, **kwargs) -> Tuple[torch.Tensor, Any]:
         if not isinstance(x_list, list):
@@ -743,9 +773,17 @@ class GateNode(HeteroNode):
         n = len(x_list)
         if n == 0:
             raise ValueError("GateNode received no predecessors")
-        weights = F.softmax(self.weights[:n], dim=0)
-        out = sum(w * x for w, x in zip(weights, x_list))
-        out = self.out_proj(out)
+        if n == 1 or self.weights is None:
+            if n > 1:
+                # weights removed (single-pred at build time) but more inputs
+                # arrived: fall back to a uniform mean rather than dropping any.
+                out = torch.stack(x_list, dim=0).mean(dim=0)
+            else:
+                out = x_list[0]
+        else:
+            weights = F.softmax(self.weights[:n], dim=0)
+            out = sum(w * x for w, x in zip(weights, x_list))
+        out = self.out_proj(self.norm(out))
         return self.dropout(out), None
 
 
