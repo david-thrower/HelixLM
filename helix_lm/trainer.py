@@ -495,8 +495,11 @@ class Trainer:
 
             loss = outputs["loss"]
             if not (torch.isnan(loss) or torch.isinf(loss)):
-                # Count valid (non -100) tokens for weighting
-                valid_tokens = (labels != -100).sum().item()
+                # Count valid (non -100) tokens for weighting.
+                # The model's loss is over shifted labels (labels[:, 1:]),
+                # so count shifted labels too; the unshifted count is off by
+                # one position per sequence (and by any leading -100).
+                valid_tokens = (labels[:, 1:] != -100).sum().item()
                 
                 # Weight loss by token count
                 total_loss += loss.item() * valid_tokens
