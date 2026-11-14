@@ -114,6 +114,8 @@ class HelixConfig(PretrainedConfig):
         epochs: int = 100,
         warmup_steps: int = 100,
         grad_clip: float = 1.0,
+        lr_schedule: str = "cosine",     # "cosine" | "wsd" | "constant"
+        wsd_decay_frac: float = 0.2,     # fraction of steps spent in the decay phase
 
         # --- Initialization ---
         initializer_range: float = 0.02,
@@ -257,6 +259,8 @@ class HelixConfig(PretrainedConfig):
         self.epochs = epochs
         self.warmup_steps = warmup_steps
         self.grad_clip = grad_clip
+        self.lr_schedule = lr_schedule
+        self.wsd_decay_frac = wsd_decay_frac
         self.initializer_range = initializer_range
         self.device = device
         if isinstance(dtype, str):

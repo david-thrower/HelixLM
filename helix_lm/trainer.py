@@ -34,6 +34,37 @@ from .hf_model import HelixForCausalLM
 from .dataset import create_document_loader, create_unified_data_loader, _is_iterable_column
 
 
+def get_wsd_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    decay_frac: float = 0.2,
+    min_lr_ratio: float = 0.1,
+):
+    """Warmup-Stable-Decay: linear warmup, constant peak, linear decay to min_lr_ratio.
+
+    Keeps the learning rate at peak for (1 - decay_frac) of training, then anneals
+    over the tail. Unlike cosine it does not spend the middle of the run decaying;
+    unlike a constant schedule it still anneals, which is what stops the late
+    gyration seen when the LR is held at peak to the last step.
+    """
+    num_warmup_steps = max(1, int(num_warmup_steps))
+    num_training_steps = max(num_warmup_steps + 1, int(num_training_steps))
+    decay_steps = max(1, int(round(num_training_steps * float(decay_frac))))
+    stable_end = max(num_warmup_steps, num_training_steps - decay_steps)
+    floor = float(min_lr_ratio)
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(num_warmup_steps)
+        if current_step < stable_end:
+            return 1.0
+        progress = (current_step - stable_end) / float(max(1, num_training_steps - stable_end))
+        return max(floor, 1.0 - (1.0 - floor) * min(1.0, progress))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
 def get_cosine_schedule_with_warmup(
     optimizer,
     num_warmup_steps: int,
@@ -1265,6 +1296,8 @@ class PretrainTrainer(Trainer):
             "warmup_steps": int(self._scheduler_warmup),
             "cycles": float(self._scheduler_cycles),
             "min_lr_ratio": float(self._scheduler_min_lr),
+            "lr_schedule": str(getattr(self.cfg, "lr_schedule", "cosine")),
+            "wsd_decay_frac": float(getattr(self.cfg, "wsd_decay_frac", 0.2)),
         }
 
     def _training_config(self) -> Dict[str, Any]:
@@ -1398,13 +1431,35 @@ class PretrainTrainer(Trainer):
         # Initialize scheduler without relying on len
         if self.scheduler is None:
             total_steps = self.total_optimizer_steps if self.total_optimizer_steps is not None else 10**9
-            self.scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=self._scheduler_warmup,
-                num_training_steps=total_steps,
-                num_cycles=self._scheduler_cycles,
-                min_lr_ratio=self._scheduler_min_lr,
-            )
+            schedule = getattr(self.cfg, "lr_schedule", "cosine")
+            if schedule == "wsd":
+                # WSD needs a real horizon: with total_steps=None (1e9) it would
+                # sit at peak LR forever, which is the failure it exists to fix.
+                if self.total_optimizer_steps is None:
+                    raise ValueError("lr_schedule='wsd' requires total_optimizer_steps")
+                self.scheduler = get_wsd_schedule_with_warmup(
+                    self.optimizer,
+                    num_warmup_steps=self._scheduler_warmup,
+                    num_training_steps=total_steps,
+                    decay_frac=getattr(self.cfg, "wsd_decay_frac", 0.2),
+                    min_lr_ratio=self._scheduler_min_lr,
+                )
+            elif schedule == "constant":
+                self.scheduler = get_cosine_schedule_with_warmup(
+                    self.optimizer,
+                    num_warmup_steps=self._scheduler_warmup,
+                    num_training_steps=total_steps,
+                    num_cycles=self._scheduler_cycles,
+                    min_lr_ratio=1.0,
+                )
+            else:
+                self.scheduler = get_cosine_schedule_with_warmup(
+                    self.optimizer,
+                    num_warmup_steps=self._scheduler_warmup,
+                    num_training_steps=total_steps,
+                    num_cycles=self._scheduler_cycles,
+                    min_lr_ratio=self._scheduler_min_lr,
+                )
             if self._resume_scheduler_state is not None:
                 self.scheduler.load_state_dict(self._resume_scheduler_state)
                 self._resume_scheduler_state = None
