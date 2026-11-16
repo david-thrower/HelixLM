@@ -64,18 +64,24 @@ class TiedLMHead(nn.Module):
         super().__init__()
         # Share the embedding weight tensor (shape: vocab_size, d_model)
         self.weight = embed_weight
-        # Learnable gradient buffer: a small projection that absorbs
-        # some of the lm_head gradient before it reaches embeddings
-        self.buffer = nn.Linear(d_model, d_model, bias=False)
-        nn.init.eye_(self.buffer.weight)  # start as identity (no forward diff at init)
-        self.grad_buffer_ratio = grad_buffer_ratio
+        self.grad_buffer_ratio = float(grad_buffer_ratio)
+        # A disabled buffer has no forward or backward role. Do not allocate a
+        # d_model² parameter that can never receive a gradient or affect logits.
+        # Checkpoints trained with ratio=0 may still contain the old key; HF's
+        # non-strict from_pretrained load reports and ignores that inactive key.
+        if self.grad_buffer_ratio > 0:
+            self.buffer = nn.Linear(d_model, d_model, bias=False)
+            nn.init.eye_(self.buffer.weight)  # identity: no forward diff at init
+        else:
+            self.buffer = None
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         # h: (B, T, d_model)
         # P0 FIX: Buffer applied consistently in BOTH train and eval.
         # Forward pass must NEVER depend on self.training.
-        # Defensive: align h dtype to buffer weight dtype (guards against upstream casts)
-        h = h.to(self.buffer.weight.dtype)
+        # Defensive: align h dtype to the active projection's weight dtype.
+        compute_dtype = self.buffer.weight.dtype if self.buffer is not None else self.weight.dtype
+        h = h.to(compute_dtype)
         if 0 < self.grad_buffer_ratio < 1:
             h_buffered = self.buffer(h)
             h_mixed = (1 - self.grad_buffer_ratio) * h + self.grad_buffer_ratio * h_buffered
@@ -113,8 +119,15 @@ class StopStringCriteria(StoppingCriteria):
 class HelixPreTrainedModel(PreTrainedModel):
     """Base class for HelixLM models with HF integration."""
     config_class = HelixConfig
-    base_model_prefix = "helix"
+    # The core lives in `self.model` (checkpoint keys are "model.*").
+    base_model_prefix = "model"
     supports_gradient_checkpointing = True
+
+    @classmethod
+    def _supports_default_dynamic_cache(cls) -> bool:
+        # Stateless recurrent graph: there is no KV cache of any kind, so
+        # generate() must not build a DynamicCache for this model.
+        return False
     _no_split_modules = ["HelixRecurrentBlock"]
 
     def _init_weights(self, module):
@@ -260,24 +273,33 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         # SACRED: Pass e (NOT detached) to preserve full gradient flow.
         # e.detach() was tested and causes ~2x PPL regression.
         # Pass attention_mask and cca_step for regression fixes (mask propagation, CCA)
-        h = self.model.recurrent(
-            e, e,
-            attention_mask=attention_mask,
-            cca_step=kwargs.get("cca_step", None),
-        )
+        if not self.training and self.canonical_eval_layout:
+            # Eval/inference: run every row at the training layout (content at
+            # index 0, length cfg.seq_len, right-padded) so the compressed-branch
+            # boundaries and the window grid match training exactly; results are
+            # scattered back to the caller's positions. See _canonical_eval_hidden.
+            h = self._canonical_eval_hidden(e, attention_mask, kwargs.get("cca_step", None))
+        else:
+            h = self.model.recurrent(
+                e, e,
+                attention_mask=attention_mask,
+                cca_step=kwargs.get("cca_step", None),
+            )
 
         # Output
         # P2 FIX: Removed the CUDA-only h.clone() band-aid. The clone
         # was hiding an in-place op bug (likely in RMSNorm). If in-place
         # errors resurface, fix them at the source — not with conditional clones.
         h = self.model.out_norm(h)
-        logits = self.lm_head(h)
+        # Logits and loss are always returned in fp32, also when the weights are
+        # bf16/fp16: a bf16 log-softmax over 50k classes loses ~0.01 nats.
+        logits = self.lm_head(h).float()
 
         loss = None
         if labels is not None:
             # Shift by 1 for next-token prediction:
             # logits[:, :-1] predicts labels[:, 1:]
-            shift_logits = logits[:, :-1, :].reshape(-1, self.config.vocab_size)
+            shift_logits = logits[:, :-1, :].float().reshape(-1, self.config.vocab_size)
             shift_labels = labels[:, 1:].reshape(-1)
             if getattr(self.config, "memory_efficient_forward", False):
                 del logits
@@ -298,6 +320,54 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
             hidden_states=h if output_hidden_states else None,
             attentions=None,
         )
+
+    # Eval-only layout canonicalisation (set False to get the raw layout back).
+    canonical_eval_layout = True
+
+    def _canonical_eval_hidden(
+        self,
+        e: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        cca_step: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Run the recurrent block at the training layout and map back.
+
+        Training only ever saw full ``cfg.seq_len`` windows whose content starts
+        at index 0. The multi-scale attention is not translation- or
+        length-invariant: its compressed boundaries are linspace(0, T-1, K) and
+        its local/coarse windows are aligned to multiples of the window size,
+        both measured from index 0 of the *padded* tensor. A prompt therefore
+        got different logits depending on its batch's padded length and on left
+        vs right padding.
+
+        Here every row's valid tokens (attention_mask == 1, in order) are packed
+        to positions 0..n-1 of a length-T buffer (T = cfg.seq_len), right-padded
+        and masked, the block runs at length T, and the hidden states are
+        gathered back to the caller's positions (padded positions get 0, so
+        their logits are 0). The model is causal, so a token's output equals
+        its output inside a full training window with the same prefix.
+
+        Cost: every eval forward runs at T = cfg.seq_len (2048 for the released
+        model), whatever the prompt length. If a row has more than T valid
+        tokens, the raw layout is used unchanged.
+        """
+        B, L, D = e.shape
+        T = int(self.config.seq_len)
+        if attention_mask is None:
+            valid = torch.ones(B, L, dtype=torch.bool, device=e.device)
+        else:
+            valid = attention_mask.to(device=e.device).bool()
+        n = valid.sum(dim=1)
+        if B == 0 or int(n.max()) > T:
+            return self.model.recurrent(e, e, attention_mask=attention_mask, cca_step=cca_step)
+        # destination slot of each caller position; padded positions go to slot T (dropped)
+        dest = torch.where(valid, valid.long().cumsum(dim=1) - 1, torch.full_like(n[:, None], T))
+        idx = dest.unsqueeze(-1).expand(B, L, D)
+        e_c = e.new_zeros(B, T + 1, D).scatter(1, idx, e)[:, :T]
+        mask_c = (torch.arange(T, device=e.device).unsqueeze(0) < n.unsqueeze(1)).long()
+        h_c = self.model.recurrent(e_c, e_c, attention_mask=mask_c, cca_step=cca_step)
+        h_c = torch.cat([h_c, h_c.new_zeros(B, 1, D)], dim=1)
+        return h_c.gather(1, idx)
 
     def prepare_inputs_for_generation(
         self,
