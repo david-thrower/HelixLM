@@ -34,8 +34,12 @@ def apply_rotary(x: torch.Tensor, positions: torch.Tensor, theta: float = 10000.
     angles = positions.to(torch.float32).unsqueeze(-1) * freqs.view(1, 1, -1)
     cos = angles.cos().unsqueeze(1)
     sin = angles.sin().unsqueeze(1)
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    # Rotate in fp32 for accuracy, then return in the caller's dtype: returning
+    # fp32 here promoted q/k (and the scores) to fp32 under pure-bf16 weights,
+    # and the attn @ v matmul then failed on mixed dtypes.
+    xf = x.float()
+    x1, x2 = xf[..., :half], xf[..., half:]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).to(x.dtype)
 
 
 class RMSNorm(nn.Module):
@@ -98,6 +102,8 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         dropout: float = 0.0,
         attn_dropout: float = 0.0,
         strict_nan_check: bool = False,       # Issue 1: raise on corrupt NaN
+        sliding_windows: bool = False,        # C7: causal sliding local/coarse windows
+        compressed_stride: Optional[int] = None,  # C7: fixed-stride compressed boundaries
         use_rope: bool = False,               # apply RoPE to q/k in every attention path
         rope_theta: float = 10000.0,
         # Deprecated: kept for config compatibility, ignored.
@@ -133,6 +139,11 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
 
         # Issue 1: strict NaN detection is opt-in (default: non-raising, training-stable)
         self.strict_nan_check = bool(strict_nan_check)
+        # C7 (both default off: no new parameters, identical behaviour).
+        self.sliding_windows = bool(sliding_windows)
+        if compressed_stride is not None and int(compressed_stride) <= 0:
+            raise ValueError("compressed_stride must be positive")
+        self.compressed_stride = int(compressed_stride) if compressed_stride is not None else None
         self.use_rope = bool(use_rope)
         self.rope_theta = float(rope_theta)
 
@@ -273,7 +284,7 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         attn = torch.where(row_has_key, attn, torch.zeros_like(attn))
         attn = self.attn_dropout(attn)
 
-        out = torch.matmul(attn, v)  # [N, H, L, Dh]
+        out = torch.matmul(attn.to(v.dtype), v)  # [N, H, L, Dh]  dtype-safe: attn is fp32 by design (softmax stability), v follows the model dtype
         return out
 
     def _check_finite_output(self, out, valid_mask, label: str):
@@ -297,6 +308,8 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         return x, pad_len
 
     def _windowed_attn(self, x: torch.Tensor, win: int, attention_mask: Optional[torch.Tensor] = None):
+        if self.sliding_windows:
+            return self._sliding_windowed_attn(x, win, attention_mask=attention_mask)
         B, T, D = x.shape
         x_pad, pad_len = self._pad_to_window(x, win)
         T_pad = T + pad_len
@@ -334,6 +347,74 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
 
         out = out.view(B, nwin, win, D).reshape(B, T_pad, D)
         return out[:, :T, :]
+
+    def _sliding_windowed_attn(self, x: torch.Tensor, win: int,
+                               attention_mask: Optional[torch.Tensor] = None):
+        """C7: exact causal sliding-window attention.
+
+        Query t attends to keys max(0, t-win+1)..t (never a block-aligned
+        window), so every token sees its previous win-1 tokens and the output
+        at t does not depend on where t falls relative to a window boundary or
+        on the total length T.
+
+        Blocked form: pad T to a multiple of win; block i's queries attend to
+        the 2*win keys of blocks i-1 and i through a fixed band mask. The
+        existing _safe_attention is reused (same NaN/empty-row policy), with the
+        previous block's rows passed as invalid queries and sliced off, so the
+        score tensor is [2*win, 2*win] per block (4x the block-window cost,
+        still O(T*win)). RoPE uses absolute positions.
+        """
+        B, T, D = x.shape
+        x_pad, pad_len = self._pad_to_window(x, win)
+        T_pad = T + pad_len
+        nwin = T_pad // win
+
+        if attention_mask is not None:
+            valid = attention_mask.to(dtype=torch.bool, device=x.device)
+        else:
+            valid = torch.ones((B, T), dtype=torch.bool, device=x.device)
+        if pad_len:
+            valid = F.pad(valid, (0, pad_len), value=False)
+        x_pad = torch.where(valid.unsqueeze(-1), x_pad, torch.zeros_like(x_pad))
+
+        pos = (torch.arange(T_pad, device=x.device).unsqueeze(0).expand(B, T_pad)
+               if self.use_rope else None)
+        q, k, v = self._project_qkv(x_pad, self.qkv_proj, self.n_heads, self.head_dim,
+                                    positions=pos)              # [B, H, T_pad, Dh]
+        H, Dh = self.n_heads, self.head_dim
+
+        def blocks(t):  # [B, H, T_pad, Dh] -> [B*nwin, H, 2*win, Dh] (prev block ++ block)
+            t = t.view(B, H, nwin, win, Dh).permute(0, 2, 1, 3, 4)       # [B, nwin, H, win, Dh]
+            prev = torch.cat([torch.zeros_like(t[:, :1]), t[:, :-1]], dim=1)
+            return torch.cat([prev, t], dim=3).reshape(B * nwin, H, 2 * win, Dh)
+
+        qb, kb, vb = blocks(q), blocks(k), blocks(v)
+        vw = valid.view(B, nwin, win)
+        vprev = torch.cat([torch.zeros_like(vw[:, :1]), vw[:, :-1]], dim=1)
+        key_valid = torch.cat([vprev, vw], dim=2).reshape(B * nwin, 2 * win)
+        query_valid = torch.cat([torch.zeros_like(vw), vw], dim=2).reshape(B * nwin, 2 * win)
+
+        r = torch.arange(2 * win, device=x.device)
+        band = (r.view(-1, 1) >= r.view(1, -1)) & (r.view(-1, 1) - r.view(1, -1) < win)
+
+        out = self._safe_attention(qb, kb, vb, band, key_valid, query_valid)
+        out = out[:, :, win:, :]                                      # this block's queries
+        out = out.transpose(1, 2).reshape(B * nwin, win, D)
+        out = self.out_proj(out)
+        mask_win = vw.reshape(B * nwin, win)
+        out = torch.where(mask_win.unsqueeze(-1), out, torch.zeros_like(out))
+        out = self._check_finite_output(out, mask_win, "windowed")
+        return out.view(B, nwin, win, D).reshape(B, T_pad, D)[:, :T, :]
+
+    def _fixed_stride_boundaries(self, T: int, device) -> torch.Tensor:
+        """C7: boundaries 0, S, 2S, ... (< T) with S = compressed_stride.
+
+        Independent of T, so a prefix sees exactly the first boundaries of a
+        longer input. Starting at 0 means every token has a boundary <= t, so
+        no token is ever mapped to a summary that contains future tokens. The
+        number of compressed positions is ceil(T / S) (= K at T = seq_len).
+        """
+        return torch.arange(0, T, self.compressed_stride, device=device, dtype=torch.long)
 
     # ------------------------------------------------------------------
     # Causal compressed branch (Issues 2 + 3)
@@ -399,7 +480,11 @@ class ErrorCorrectingMultiScaleAttnNode(HeteroNode):
         else:
             valid = torch.ones((B, T), dtype=torch.bool, device=x.device)
 
-        boundaries = self._causal_boundaries(T, K, x.device)
+        if self.compressed_stride is not None:
+            boundaries = self._fixed_stride_boundaries(T, x.device)
+            K = int(boundaries.shape[0])
+        else:
+            boundaries = self._causal_boundaries(T, K, x.device)
         causal_K = torch.tril(torch.ones(K, K, device=x.device, dtype=torch.bool))
 
         view_outputs = []
@@ -588,7 +673,11 @@ class LinearAttnNode(HeteroNode):
         kv_cum = torch.cumsum(kv, dim=-1)              # one contiguous scan per row
         kv_cum = kv_cum.permute(0, 1, 4, 2, 3)        # [B, H, T, F, D]
 
-        z = torch.cumsum(k_fp32, dim=2).sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        # Normaliser of causal linear attention: z_t = phi(q_t) . sum_{s<=t} phi(k_s),
+        # so the weights phi(q_t).phi(k_s) / z_t sum to 1 over s <= t. The old
+        # sum over features of cumsum(phi(k)) left q out of the denominator, so
+        # the output was not a convex combination of the values.
+        z = torch.einsum('bhTf,bhTf->bhT', q_fp32, torch.cumsum(k_fp32, dim=2)).unsqueeze(-1).clamp(min=1e-6)
 
         out = torch.einsum('bhTf,bhTfd->bhTd', q_fp32, kv_cum) / z
         out = out.to(x.dtype)  # cast back to fp16/bf16
@@ -602,12 +691,13 @@ class LinearAttnNode(HeteroNode):
 class FullAttnNode(HeteroNode):
     """Standard causal softmax attention with multi-head support and optional RoPE."""
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.0, use_rope: bool = True,
-                 attn_dropout: float = 0.0):
+                 attn_dropout: float = 0.0, rope_theta: float = 10000.0):
         super().__init__(d_model)
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.use_rope = use_rope
+        self.rope_theta = float(rope_theta)
         self.scale = self.head_dim ** -0.5
 
         self.q_proj = nn.Linear(d_model, d_model)
@@ -633,22 +723,40 @@ class FullAttnNode(HeteroNode):
         k = self.k_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        # use_rope was accepted and ignored: the node had no positional signal
+        # beyond the causal mask. Rotate q/k by absolute position (relative
+        # offsets only enter the scores).
+        if self.use_rope:
+            pos = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+            q = apply_rotary(q, pos, self.rope_theta)
+            k = apply_rotary(k, pos, self.rope_theta)
+
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         # Causal mask
-        causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal_mask, float('-inf'))
+        allowed = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool)).view(1, 1, T, T)
         # Padding mask: prevent attending to padded positions
+        valid = None
         if attention_mask is not None:
             # attention_mask: (B, T) with 0 for pad, 1 for real
-            # Expand to (B, n_heads, T, T) to mask key positions for all queries
-            pad_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(pad_mask.expand(-1, self.n_heads, T, -1), float('-inf'))
+            valid = attention_mask.to(device=x.device).bool()
+            allowed = allowed & valid.view(B, 1, 1, T)
+        allowed = allowed.expand(B, self.n_heads, T, T)
+        # A query with no lawful key (e.g. a left-padded position) softmaxed over
+        # all -inf and produced NaN; give such rows a finite placeholder and zero
+        # their weights instead.
+        row_has_key = allowed.any(dim=-1, keepdim=True)
+        scores = scores.masked_fill(~allowed, float('-inf'))
+        scores = torch.where(row_has_key, scores, torch.zeros_like(scores))
 
-        attn = F.softmax(scores, dim=-1)
+        attn = F.softmax(scores.float(), dim=-1).to(v.dtype)
+        attn = torch.where(row_has_key, attn, torch.zeros_like(attn))
         attn = self.attn_dropout(attn)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(B, T, D)
         out = self.resid_dropout(self.out_proj(out))
+        if valid is not None:
+            # padded query positions carry no output (no out_proj bias leak)
+            out = torch.where(valid.unsqueeze(-1), out, torch.zeros_like(out))
         return out, None
 
 
@@ -730,12 +838,14 @@ class SSMNode(HeteroNode):
 
         dt = F.softplus(self.dt_proj(x_conv))
         A = -torch.exp(self.A_log.float())
-        B = self.B_proj(x_conv)
+        # (named B_sel, not B: `B` is the batch size from x.shape above, and
+        # shadowing it made torch.zeros(B, ...) below crash with a tensor arg)
+        B_sel = self.B_proj(x_conv)
         C = self.C_proj(x_conv)
 
         dt = dt.float()
         A_bar = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0).unsqueeze(0))
-        B_bar = dt.unsqueeze(-1) * B.unsqueeze(2)
+        B_bar = dt.unsqueeze(-1) * B_sel.unsqueeze(2)
 
         if state is None:
             h = torch.zeros(B, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
@@ -914,12 +1024,22 @@ class TitansMemoryNode(HeteroNode):
         k = self.phi(self.k_proj(x_norm))  # (B, T, feature_dim)
         v = self.v_proj(x_norm)             # (B, T, d_model)
 
-        # 3. Memory update loop (test-time learning)
+        # 3. Memory read + update loop (test-time learning).
+        # Causal: token t reads the memory BEFORE it is written with token t
+        # (it holds tokens < t only). Previously every position read the memory
+        # after the whole sequence had been written, so position 0 saw the future.
         eta = self.eta.abs().clamp(min=1e-6)  # (feature_dim,)
+        q = self.phi(self.q_proj(x_norm))  # (B, T, feature_dim)
+        valid = (attention_mask.to(device=device).bool()
+                 if attention_mask is not None else None)
 
+        reads = []
         for t in range(T):
             k_t = k[:, t, :]          # (B, feature_dim)
             v_t = v[:, t, :]          # (B, d_model)
+
+            # 4. Retrieval for position t from memory over tokens < t
+            reads.append(torch.einsum('bf,bfd->bd', q[:, t, :], M))
 
             # Surprise metric: deviation of memory prediction from true value
             v_pred = torch.einsum('bf,bfd->bd', k_t, M)
@@ -929,14 +1049,14 @@ class TitansMemoryNode(HeteroNode):
             delta = torch.matmul(k_t.unsqueeze(-1), v_t.unsqueeze(1))
 
             # Surprise-gated update with learnable per-coordinate LR
-            M = M + eta.view(1, -1, 1) * surprise.unsqueeze(-1) * delta
+            M_new = M + eta.view(1, -1, 1) * surprise.unsqueeze(-1) * delta
 
             # Layer norm over the feature_dim dimension to prevent explosion
-            M = F.layer_norm(M, M.shape[-2:])
+            M_new = F.layer_norm(M_new, M_new.shape[-2:])
+            # padded positions do not write into the memory
+            M = M_new if valid is None else torch.where(valid[:, t].view(B, 1, 1), M_new, M)
 
-        # 4. Memory retrieval for output
-        q = self.phi(self.q_proj(x_norm))  # (B, T, feature_dim)
-        mem_out = torch.einsum('btf,bfd->btd', q, M)  # (B, T, d_model)
+        mem_out = torch.stack(reads, dim=1)  # (B, T, d_model)
 
         # 5. Output projection + residual
         out = self.dropout(self.out_proj(mem_out))
