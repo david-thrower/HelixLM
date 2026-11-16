@@ -17,6 +17,13 @@ from typing import List, Tuple, Optional, Dict, Any
 import torch
 from transformers import PretrainedConfig
 
+# Sampling parameters belong in generation_config.json. transformers >= 5 raises
+# in save_pretrained()/generate() when the *model* config carries them, so
+# HelixConfig no longer accepts them as named arguments. Old config.json files
+# that still contain them load fine: the keys arrive via **kwargs and are dropped.
+GENERATION_KEYS = ("max_new_tokens", "temperature", "top_k", "top_p", "min_p",
+                   "repetition_penalty", "do_sample")
+
 
 class HelixConfig(PretrainedConfig):
     """
@@ -71,6 +78,8 @@ class HelixConfig(PretrainedConfig):
         consensus_type: str = "cosine",
         corrector_type: str = "ffn",
         strict_nan_check: bool = False,         # Issue 1: raise on corrupt NaN (opt-in)
+        ecmsa_sliding: bool = False,            # C7: true causal sliding local/coarse windows (opt-in)
+        ecmsa_fixed_stride: bool = False,       # C7: compressed boundaries every seq_len//K tokens (opt-in)
 
         # --- SSM (Mamba-2 SSD) ---
         use_ssm: bool = False,
@@ -131,14 +140,6 @@ class HelixConfig(PretrainedConfig):
         pad_token_id: int = 0,
         eos_token_id: int = 0,
         bos_token_id: int = 0,
-
-        # --- Generation ---
-        max_new_tokens: int = 20,
-        temperature: float = 0.8,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        repetition_penalty: float = 1.0,
-        do_sample: bool = True,
 
         # --- Chat / Template ---
         chat_template: Optional[str] = None,
@@ -210,6 +211,12 @@ class HelixConfig(PretrainedConfig):
         self.consensus_type = consensus_type
         self.corrector_type = corrector_type
         self.strict_nan_check = strict_nan_check
+        # C7 (opt-in, default off so released checkpoints keep their behaviour):
+        # sliding windows + fixed-stride compressed boundaries make ECMSA
+        # length-invariant and remove the window-start blind spot. Changing
+        # either flag on a trained checkpoint changes its outputs -> retrain.
+        self.ecmsa_sliding = bool(ecmsa_sliding)
+        self.ecmsa_fixed_stride = bool(ecmsa_fixed_stride)
 
         # --- CCA ---
         self.use_cca = use_cca
@@ -278,12 +285,10 @@ class HelixConfig(PretrainedConfig):
         self.tokenizer_name = tokenizer_name
 
         # --- Generation ---
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.top_k = top_k
-        self.top_p = top_p
-        self.repetition_penalty = repetition_penalty
-        self.do_sample = do_sample
+        # Not stored on the model config (see GENERATION_KEYS); legacy values
+        # passed by old configs are dropped here, before PretrainedConfig sees them.
+        for _key in GENERATION_KEYS:
+            kwargs.pop(_key, None)
 
         # --- Chat ---
         self.chat_template = chat_template
