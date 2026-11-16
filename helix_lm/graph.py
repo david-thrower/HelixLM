@@ -168,6 +168,11 @@ class HelixGraph(nn.Module):
                     "dropout": cfg.dropout,
                     "attn_dropout": attn_drop,
                     "strict_nan_check": getattr(cfg, "strict_nan_check", False),
+                    "sliding_windows": getattr(cfg, "ecmsa_sliding", False),
+                    "compressed_stride": (
+                        max(1, int(cfg.seq_len) // max(1, int(getattr(cfg, "compressed_windows", 8))))
+                        if getattr(cfg, "ecmsa_fixed_stride", False) else None
+                    ),
                     "use_rope": getattr(cfg, "use_rope", False),
                     "rope_theta": getattr(cfg, "rope_theta", 10000.0),
                     # Issue 6: output_ffn_dim intentionally NOT passed.
