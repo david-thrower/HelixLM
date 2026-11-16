@@ -87,7 +87,10 @@ class HelixRecurrentBlock(nn.Module):
         for t in range(self.cfg.n_loops):
             h_loop = loop_index_embedding(h, t, self.loop_dim)
             combined = self.norm(h_loop + e)
-            trans_out, node_states = self.graph(combined, states=node_states, attention_mask=attention_mask, cca_step=cca_step)
+            # Fresh node state every loop: a stateful node (Titans memory, SSM,
+            # Mamba-2) ends a loop holding a summary of the WHOLE sequence; seeding
+            # the next loop with it let position 0 see future tokens.
+            trans_out, node_states = self.graph(combined, states={}, attention_mask=attention_mask, cca_step=cca_step)
             h = self.injection(h, e, trans_out)
             p = self.act(h)
 
