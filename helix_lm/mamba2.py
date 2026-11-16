@@ -129,17 +129,19 @@ class Mamba2SSD(nn.Module):
         if self.use_fast_path and x.is_cuda and batch <= 32:
             # Fast path: parallel associative scan
             y = self._ssd_parallel(A_bar, B_bar, x_conv, C)
+            new_state = None
         else:
-            # Sequential scan (CPU-friendly, lower memory)
+            # Sequential scan (CPU-friendly, lower memory). It used to return
+            # here, skipping the D skip and out_proj: the CPU path emitted
+            # d_inner-wide raw scan output instead of d_model.
             y, new_state = self._ssd_sequential(A_bar, B_bar, x_conv, C, state)
-            return y, new_state
 
         # D skip connection
         y = y + self.D * x_conv
 
         # Output projection
         out = self.out_proj(y.to(x.dtype))
-        return out, None
+        return out, new_state
 
     def _ssd_sequential(self, A_bar, B_bar, x_conv, C, state):
         """Sequential scan for CPU / low-memory scenarios."""
