@@ -110,7 +110,12 @@ class HelixRecurrentBlock(nn.Module):
             cum_p = cum_p + p * still.float()
             halted = halted | (cum_p >= self.cfg.act_threshold)
 
-            if halted.all() and not self.training:
+            # Eager-mode early exit only. Once every token has halted, later
+            # loops add weight 0 (still is all False), so skipping them never
+            # changes the output. Under torch.compile the data-dependent
+            # `halted.all()` would be a graph break and a host sync per call, so
+            # the compiled graph runs the fixed n_loops instead.
+            if not self.training and not torch.compiler.is_compiling() and halted.all():
                 break
 
         return h_out
