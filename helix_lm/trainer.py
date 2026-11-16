@@ -48,18 +48,27 @@ def get_wsd_schedule_with_warmup(
     unlike a constant schedule it still anneals, which is what stops the late
     gyration seen when the LR is held at peak to the last step.
     """
+    floor = float(min_lr_ratio)
+    if floor >= 1.0:
+        raise ValueError(
+            f"WSD with min_lr_ratio={floor} never decays; pass min_lr_ratio < 1 "
+            "(PretrainTrainer's default min_lr_ratio is 1.0)")
     num_warmup_steps = max(1, int(num_warmup_steps))
     num_training_steps = max(num_warmup_steps + 1, int(num_training_steps))
     decay_steps = max(1, int(round(num_training_steps * float(decay_frac))))
     stable_end = max(num_warmup_steps, num_training_steps - decay_steps)
-    floor = float(min_lr_ratio)
 
+    # lr_lambda(k) is the lr used by optimizer step k = 0 .. num_training_steps-1.
+    # Warmup: (k+1)/W, so step 0 is not wasted at lr 0 and step W-1 is at peak.
+    # Decay: (k - stable_end + 1)/(T - stable_end), so the LAST step that is
+    # actually taken (k = T-1) runs at the floor; previously the floor was only
+    # reached at k = T, after training had ended.
     def lr_lambda(current_step: int) -> float:
         if current_step < num_warmup_steps:
-            return float(current_step) / float(num_warmup_steps)
+            return float(current_step + 1) / float(num_warmup_steps)
         if current_step < stable_end:
             return 1.0
-        progress = (current_step - stable_end) / float(max(1, num_training_steps - stable_end))
+        progress = (current_step - stable_end + 1) / float(max(1, num_training_steps - stable_end))
         return max(floor, 1.0 - (1.0 - floor) * min(1.0, progress))
 
     return LambdaLR(optimizer, lr_lambda)
@@ -79,6 +88,8 @@ def get_cosine_schedule_with_warmup(
         progress = float(current_step - num_warmup_steps) / float(
             max(1, num_training_steps - num_warmup_steps)
         )
+        # Clamp: past num_training_steps the cosine would climb back up.
+        progress = min(1.0, max(0.0, progress))
         cosine = 0.5 * (
             1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress)
         )
@@ -99,6 +110,45 @@ def format_time(seconds: float) -> str:
     elif seconds < 3600:
         return f"{seconds/60:.1f}m"
     return f"{seconds/3600:.1f}h"
+
+
+# Parameter names (leaf or suffix) that never take weight decay even if they are
+# matrices: learned temperatures, the LTI injection (A/dt/B) and SSM A/D terms.
+_NO_DECAY_NAME_SUFFIXES = (
+    "temp", "log_A", "log_dt", "injection.B", "A_log", ".D", "attention_gates",
+)
+
+
+def build_adamw_param_groups(model: nn.Module, weight_decay: float) -> List[Dict[str, Any]]:
+    """Split parameters into decay / no-decay AdamW groups.
+
+    No decay for: every tensor with ndim < 2 (biases, norm gains, gate logits,
+    scalars), embedding tables and anything tied to them (the tied lm_head
+    shares model.embed.weight), and the named scalars/state-space terms in
+    _NO_DECAY_NAME_SUFFIXES. Everything else (projection matrices) decays.
+    """
+    embed_ids = {
+        id(mod.weight) for mod in model.modules()
+        if isinstance(mod, nn.Embedding) and getattr(mod, "weight", None) is not None
+    }
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():   # shared (tied) params appear once
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim < 2
+            or id(param) in embed_ids
+            or any(name.endswith(sfx) or ("." + sfx + ".") in name for sfx in _NO_DECAY_NAME_SUFFIXES)
+        ):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": float(weight_decay)})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    return groups
 
 
 class Trainer:
@@ -293,9 +343,11 @@ class Trainer:
                 )
                 self._val_shard_dir = None
 
-        # AdamW with standard betas (0.9, 0.999)
+        # AdamW with standard betas (0.9, 0.999). Weight decay only on matrices:
+        # not on biases/norms/scalars, embeddings (incl. the tied lm_head) or
+        # the LTI/SSM state terms (see build_adamw_param_groups).
         self.optimizer = AdamW(
-            model.parameters(),
+            build_adamw_param_groups(model, cfg.weight_decay),
             lr=cfg.lr,
             weight_decay=cfg.weight_decay,
             betas=(0.9, 0.999),
@@ -356,6 +408,7 @@ class Trainer:
         total_loss = 0.0
         raw_count = 0
         accum_count = 0
+        group_weight = 0.0
         skipped_batches = 0
         epoch_start = time.time()
         tokens_seen = 0
@@ -429,46 +482,32 @@ class Trainer:
                     )
                 continue
 
-            # Scale loss for gradient accumulation
-            divisor = 1
-            if self.grad_accum_steps > 1:
-                is_last = (batch_idx + 1) == len(self.train_loader)
-                if is_last and accum_count < self.grad_accum_steps - 1:
-                    divisor = accum_count + 1
-                else:
-                    divisor = self.grad_accum_steps
-                loss = loss / divisor
+            # Token-weighted accumulation. Each micro-batch loss is a mean over its
+            # valid shifted targets; weighting it by its share of valid targets and
+            # dividing the accumulated gradient by the group's total weight at step
+            # time gives the token-weighted mean over the ACTUAL group, whatever its
+            # size (the old per-batch divisor mis-weighted a short final group and
+            # averaged batch means, so a 1-target batch counted as much as a full one).
+            n_targets = int((labels[:, 1:] != -100).sum().item())
+            weight = n_targets / max(1, labels[:, 1:].numel())
 
             # Backward pass — scale only if scaler exists
             if self.scaler is not None:
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(loss * weight).backward()
             else:
-                loss.backward()
+                (loss * weight).backward()
 
             accum_count += 1
-            total_loss += loss.item() * divisor
+            group_weight += weight
+            total_loss += loss.item()
             raw_count += 1
 
             # Optimizer step after accumulation
             is_last = (batch_idx + 1) == len(self.train_loader)
             if accum_count >= self.grad_accum_steps or is_last:
-                if self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.cfg.grad_clip
-                    )
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.cfg.grad_clip
-                    )
-                    self.optimizer.step()
-
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                self._sft_step(group_weight)
                 accum_count = 0
-                self.global_step += 1
+                group_weight = 0.0
 
             # Live progress bar update
             avg = total_loss / max(raw_count, 1)
@@ -489,6 +528,34 @@ class Trainer:
             "time": time.time() - epoch_start,
             "skipped_batches": skipped_batches,
         }
+
+    def _sft_step(self, group_weight: float) -> None:
+        """Optimizer step for Trainer.train_epoch: divide the accumulated
+        (target-weighted) gradients by the group's total weight, clip, step.
+        A non-finite grad norm drops the group (no optimizer/scheduler step)."""
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+        if group_weight > 0:
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.div_(group_weight)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), self.cfg.grad_clip
+        )
+        if not torch.isfinite(grad_norm):
+            if self.scaler is not None:
+                self.scaler.update()
+            self.optimizer.zero_grad()
+            self.skipped_optimizer_steps = getattr(self, "skipped_optimizer_steps", 0) + 1
+            return
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+        self.global_step += 1
 
     @torch.no_grad()
     def evaluate(self) -> Dict[str, float]:
@@ -560,13 +627,15 @@ class Trainer:
         input_ids = torch.tensor(
             [self.tokenizer.encode(prompt)], dtype=torch.long
         ).to(self.device)
-        max_tokens = max_new_tokens or self.cfg.max_new_tokens
+        # Sampling settings are no longer on HelixConfig (they live in
+        # generation_config.json); fall back to the old defaults for samples.
+        max_tokens = max_new_tokens or getattr(self.cfg, "max_new_tokens", 20)
         generated = self.model.generate_ext(
             input_ids,
             max_new_tokens=max_tokens,
-            temperature=self.cfg.temperature,
-            top_k=self.cfg.top_k,
-            top_p=self.cfg.top_p,
+            temperature=getattr(self.cfg, "temperature", 0.8),
+            top_k=getattr(self.cfg, "top_k", 50),
+            top_p=getattr(self.cfg, "top_p", 0.95),
         )
         new_tokens = generated[0][input_ids.shape[1] :]
         return self.tokenizer.decode(new_tokens, skip_special_tokens=True)
@@ -980,6 +1049,7 @@ class PretrainTrainer(Trainer):
                 drop_last=True,
                 pin_memory=pin_memory,
                 prefetch_factor=prefetch_factor,
+                seed=int(seed),
             )
             available_training_samples = (
                 len(self._train_dataset) - len(self._validation_sample_ids)
@@ -1027,6 +1097,7 @@ class PretrainTrainer(Trainer):
                 collate_fn=collate_pretrain_samples,
                 num_workers=int(num_workers),
                 pin_memory=bool(pin_memory and torch.cuda.is_available()),
+                generator=torch.Generator().manual_seed(0),  # keep global RNG untouched
             )
         elif self._indexed_train and self._validation_sample_ids:
             from torch.utils.data import Subset
@@ -1043,6 +1114,7 @@ class PretrainTrainer(Trainer):
                 collate_fn=collate_pretrain_samples,
                 num_workers=int(num_workers),
                 pin_memory=bool(pin_memory and torch.cuda.is_available()),
+                generator=torch.Generator().manual_seed(0),  # keep global RNG untouched
             )
         elif val_texts is not None:
             # Always use ContinuousWindowDataset for validation; it works for
@@ -1176,9 +1248,18 @@ class PretrainTrainer(Trainer):
         If it already exists and is valid, reuse it. If it doesn't exist, compile
         atomically via a temporary sibling directory and rename.
         """
-        from .pretrain_data import PretrainDatasetManifest, PretrainSampleCompiler
+        from .pretrain_data import (
+            PretrainDatasetManifest,
+            PretrainSampleCompiler,
+            corpus_fingerprint,
+            tokenizer_fingerprint,
+        )
 
         store_path = os.fspath(store_dir)
+        identity = {
+            "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer),
+            "corpus_fingerprint": corpus_fingerprint(texts),
+        }
 
         # Check if store_dir already exists
         if os.path.exists(store_path):
@@ -1199,6 +1280,31 @@ class PretrainTrainer(Trainer):
                                 f"Source identity mismatch for key '{k}': "
                                 f"stored {stored_source.get(k)!r} != requested {v!r}"
                             )
+                # The store keeps only token ids: a different tokenizer, EOS or
+                # corpus would otherwise be trained on silently.
+                stored_eos = manifest.value.get("eos_token_id")
+                requested_eos = getattr(tokenizer, "eos_token_id", None)
+                if stored_eos != requested_eos:
+                    raise ValueError(
+                        f"Existing store eos_token_id {stored_eos!r} != tokenizer "
+                        f"eos_token_id {requested_eos!r}"
+                    )
+                stored_source = manifest.value.get("source", {})
+                for key, current in identity.items():
+                    stored = stored_source.get(key)
+                    if stored is not None and current is not None:
+                        if stored != current:
+                            raise ValueError(
+                                f"Existing store {key} {stored!r} != requested {current!r}"
+                            )
+                    else:
+                        warnings.warn(
+                            f"[PretrainStore] cannot verify {key} for {store_path} "
+                            f"(stored={stored!r}, requested={current!r}); "
+                            "eos and seq_len were checked",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                 if self.verbose:
                     print("[PretrainStore] REUSING_VERIFIED_STORE:", store_path)
                 return store_path
@@ -1222,7 +1328,10 @@ class PretrainTrainer(Trainer):
         try:
             compiler = PretrainSampleCompiler(
                 tokenizer, seq_len, temp_dir,
-                source=source,
+                source={
+                    **source,
+                    **{k: v for k, v in identity.items() if v is not None},
+                },
             )
             compiler.compile(texts)
             if verify:
@@ -1277,6 +1386,8 @@ class PretrainTrainer(Trainer):
             collate_fn=collate_fn,
             num_workers=num_workers,
             shuffle=False,  # dataset handles shuffling
+            # own generator: iter() must not draw from the global torch RNG
+            generator=torch.Generator().manual_seed(0),
         )
 
     def _count_batches(self, loader):
@@ -1378,6 +1489,7 @@ class PretrainTrainer(Trainer):
             drop_last=True,
             pin_memory=self._indexed_pin_memory,
             prefetch_factor=self._indexed_prefetch_factor,
+            seed=self._train_seed,
         )
         if len(self.train_loader) == 0:
             raise ValueError("Indexed pretraining cursor leaves no complete training batch")
@@ -1437,6 +1549,10 @@ class PretrainTrainer(Trainer):
                 # sit at peak LR forever, which is the failure it exists to fix.
                 if self.total_optimizer_steps is None:
                     raise ValueError("lr_schedule='wsd' requires total_optimizer_steps")
+                if float(self._scheduler_min_lr) >= 1.0:
+                    raise ValueError(
+                        "lr_schedule='wsd' needs min_lr_ratio < 1; PretrainTrainer's "
+                        f"min_lr_ratio is {self._scheduler_min_lr}, which never decays")
                 self.scheduler = get_wsd_schedule_with_warmup(
                     self.optimizer,
                     num_warmup_steps=self._scheduler_warmup,
@@ -1463,6 +1579,12 @@ class PretrainTrainer(Trainer):
             if self._resume_scheduler_state is not None:
                 self.scheduler.load_state_dict(self._resume_scheduler_state)
                 self._resume_scheduler_state = None
+                # Constructing the LambdaLR above wrote lr = base * lambda(0) into
+                # the optimizer; load_state_dict restores the scheduler's counters
+                # but not the param-group lr, so the first resumed step ran at the
+                # warmup-start lr (0 for WSD). Re-apply the restored schedule.
+                for group, lr in zip(self.optimizer.param_groups, self.scheduler.get_last_lr()):
+                    group["lr"] = lr
 
         pbar = tqdm(
             self.train_loader,
@@ -1532,6 +1654,14 @@ class PretrainTrainer(Trainer):
             if accum_count == self.grad_accum_steps:
                 lr = float(self.optimizer.param_groups[0]["lr"])
                 grad_norm = self._step(accum_count)
+                if getattr(self, "_last_step_skipped", False):
+                    # Group dropped (non-finite grads): no callback/checkpoint/eval
+                    # for a step that did not happen; start the next group.
+                    accum_count = 0
+                    group_loss_weighted = 0.0
+                    group_targets = 0
+                    group_started = time.perf_counter()
+                    continue
                 step_seconds = time.perf_counter() - group_started
                 elapsed = max(time.time() - epoch_start, 1e-6)
                 if self.step_callback is not None:
@@ -1631,6 +1761,7 @@ class PretrainTrainer(Trainer):
             "skipped_batches": skipped_batches,
             "causal_targets": causal_targets_seen,
             "step_limit_reached": step_limit_reached,
+            "skipped_optimizer_steps": getattr(self, "skipped_optimizer_steps", 0),
         }
 
     def save_checkpoint(self, epoch: int, filename: Optional[str] = None):
@@ -1765,6 +1896,23 @@ class PretrainTrainer(Trainer):
             self.model.parameters(),
             self.cfg.grad_clip,
         )
+
+        if not torch.isfinite(grad_norm):
+            # A non-finite gradient (a bf16 overflow in backward is not caught by
+            # any GradScaler) would write NaN into every parameter through AdamW.
+            # Drop the whole group: no optimizer step, no scheduler step, no
+            # global_step. With an fp16 scaler, update() still runs so the scale
+            # backs off (unscale_ above recorded the inf).
+            if self.scaler is not None:
+                self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.skipped_optimizer_steps = getattr(self, "skipped_optimizer_steps", 0) + 1
+            self._last_step_skipped = True
+            if self.verbose:
+                print(f"  WARNING: non-finite grad norm ({float(grad_norm)}); "
+                      f"optimizer step skipped (total skipped: {self.skipped_optimizer_steps})")
+            return float(grad_norm)
+        self._last_step_skipped = False
 
         if self.scaler is not None:
             self.scaler.step(self.optimizer)
