@@ -12,7 +12,6 @@ import torch.nn.functional as F
 
 from .config import HelixConfig
 from .recurrent import HelixRecurrentBlock
-from .rope import precompute_freqs_cis
 from .nodes import RMSNorm
 
 
@@ -26,8 +25,12 @@ class HelixLMCore(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # --- Fix A: Global RNG self-seeding ---
-        if getattr(cfg, 'seed', None) is not None:
+        # --- Fix A: Global RNG self-seeding (fresh builds only) ---
+        # from_pretrained() builds the module under a meta-device context and
+        # then loads the weights, so seeding there buys nothing and only resets
+        # the caller's global torch/numpy/random state (sampling, data order).
+        loading_pretrained = torch.empty(0).device.type == "meta"
+        if getattr(cfg, 'seed', None) is not None and not loading_pretrained:
             torch.manual_seed(cfg.seed)
             np.random.seed(cfg.seed)
             random.seed(cfg.seed)
@@ -44,21 +47,10 @@ class HelixLMCore(nn.Module):
             if tie_weights:
                 self.head.weight = self.embed.weight  # weight tying
 
-        # RoPE frequencies
-        self.register_buffer("freqs_cis", None, persistent=False)
-        if cfg.use_rope:
-            # Defensive: cfg.dtype may be mutated to a string after save_pretrained
-            dtype = cfg.dtype
-            if isinstance(dtype, str):
-                dtype = getattr(torch, dtype.replace("torch.", ""))
-
-            freqs = precompute_freqs_cis(
-                cfg.head_dim,
-                cfg.seq_len * 4,
-                cfg.rope_theta,
-                dtype=dtype,
-            )
-            self.register_buffer("freqs_cis", freqs, persistent=False)
+        # RoPE: applied inside the attention nodes (nodes.apply_rotary, driven by
+        # cfg.use_rope / cfg.rope_theta). The old precomputed freqs_cis buffer
+        # was never read, and rope.py used a different (interleaved) pairing
+        # than nodes.apply_rotary, so both were removed.
 
         self.apply(self._init_weights)
 
