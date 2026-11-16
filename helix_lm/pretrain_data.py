@@ -46,6 +46,60 @@ def _atomic_write(path: Path, payload: bytes) -> None:
     os.replace(temporary, path)
 
 
+_TOKENIZER_PROBES = ("Hello world.", "0 1 2 3 42", "The quick brown fox, 1984; café.")
+
+
+def tokenizer_fingerprint(tokenizer: Any) -> str:
+    """Stable identity of a tokenizer: class, name, size, special ids and probe encodings.
+
+    Used to refuse reusing a pretraining store that was compiled with another
+    tokenizer (the store keeps only token ids, so the mismatch is otherwise silent).
+    """
+    try:
+        size = len(tokenizer)
+    except Exception:
+        size = getattr(tokenizer, "vocab_size", None)
+    probes = []
+    for text in _TOKENIZER_PROBES:
+        try:
+            probes.append([int(t) for t in tokenizer.encode(text, add_special_tokens=False)])
+        except Exception as exc:  # e.g. an integer-only test tokenizer
+            probes.append(type(exc).__name__)
+    value = {
+        "class": type(tokenizer).__qualname__,
+        "name": str(getattr(tokenizer, "name_or_path", getattr(tokenizer, "tokenizer_name", ""))),
+        "size": size,
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+        "probes": probes,
+    }
+    return "tok-sha256:" + hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def corpus_fingerprint(texts: Any, max_rows: int = 256) -> Optional[str]:
+    """sha256 of the first `max_rows` non-empty texts, or None if `texts` is a
+    one-shot iterator (peeking would consume rows the compiler needs)."""
+    try:
+        iterator = iter(texts)
+    except TypeError:
+        return None
+    if iterator is texts:
+        return None
+    digest = hashlib.sha256()
+    rows = 0
+    for raw_text in iterator:
+        text = str(raw_text).strip()
+        if not text:
+            continue
+        payload = text.encode("utf-8")
+        digest.update(len(payload).to_bytes(8, "little"))
+        digest.update(payload)
+        rows += 1
+        if rows >= max_rows:
+            break
+    return f"first-{rows}-rows-sha256:{digest.hexdigest()}"
+
+
 @dataclass(frozen=True)
 class PretrainDatasetManifest:
     root: Path
@@ -414,9 +468,16 @@ def create_pretrain_indexed_loader(
     drop_last: bool = True,
     pin_memory: bool = True,
     prefetch_factor: int = 4,
+    seed: int = 0,
 ) -> DataLoader:
     if len(dataset) != permutation.sample_count:
         raise ValueError("Permutation sample count does not match the pretraining dataset")
+    # A DataLoader without its own generator draws its worker base seed from the
+    # GLOBAL torch RNG on every iter(): a resumed run then restores the RNG,
+    # creates the iterator, and its dropout stream no longer matches the
+    # uninterrupted run. The order itself comes from the persisted permutation.
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
     kwargs: Dict[str, Any] = {
         "dataset": dataset,
         "batch_size": int(batch_size),
@@ -430,6 +491,7 @@ def create_pretrain_indexed_loader(
         "collate_fn": collate_pretrain_samples,
         "num_workers": int(num_workers),
         "pin_memory": bool(pin_memory and torch.cuda.is_available()),
+        "generator": generator,
     }
     if num_workers > 0:
         kwargs["persistent_workers"] = True
