@@ -469,28 +469,39 @@ class ContinuousWindowDataset(IterableDataset):
             if self.eos_token_id is not None:
                 yield self.eos_token_id
 
-    def _windowed_stream(self):
+    def _windowed_stream(self, shard: int = 0, num_shards: int = 1):
+        # Window w goes to shard w % num_shards. Every worker reads the whole
+        # token stream (the window boundaries depend on all earlier documents)
+        # but materializes only its own windows, so N workers yield exactly the
+        # windows that 0 workers yield, each once.
         buf = []
+        window_index = 0
         for token_id in self._token_stream():
             buf.append(token_id)
             if len(buf) == self.seq_len:
-                chunk = torch.tensor(buf, dtype=torch.long)
-                yield {
-                    "input_ids": chunk,
-                    "labels": chunk.clone(),
-                    "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
-                }
+                if window_index % num_shards == shard:
+                    chunk = torch.tensor(buf, dtype=torch.long)
+                    yield {
+                        "input_ids": chunk,
+                        "labels": chunk.clone(),
+                        "attention_mask": torch.ones(self.seq_len, dtype=torch.long),
+                    }
+                window_index += 1
                 buf = []
         # Drop incomplete tail
 
     def __iter__(self):
+        # DataLoader workers each get a copy of this dataset. Without sharding,
+        # num_workers=N yields every window N times.
+        worker = torch.utils.data.get_worker_info()
+        shard, num_shards = (worker.id, worker.num_workers) if worker is not None else (0, 1)
         if not self.shuffle:
-            yield from self._windowed_stream()
+            yield from self._windowed_stream(shard, num_shards)
             return
 
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + shard)  # shard 0 keeps the single-process order
         buf = []
-        for sample in self._windowed_stream():
+        for sample in self._windowed_stream(shard, num_shards):
             if len(buf) < self.buffer_size:
                 buf.append(sample)
             else:
@@ -1134,11 +1145,14 @@ def _handle_streaming_iterable(
     if min_tail_len is None:
         min_tail_len = 1
     
-    # Create cache directory
+    # Create a cache directory that belongs to this loader only. A fixed name
+    # (or a caller dir used as-is) lets a second loader overwrite the shard
+    # files a live loader still reads (same shard_0000.pkl names).
     if shard_cache_dir is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        shard_cache_dir = os.path.join(tempfile.gettempdir(), f"helix_shards_{timestamp}")
-    os.makedirs(shard_cache_dir, exist_ok=True)
+        shard_cache_dir = tempfile.mkdtemp(prefix="helix_shards_")
+    else:
+        os.makedirs(shard_cache_dir, exist_ok=True)
+        shard_cache_dir = tempfile.mkdtemp(prefix="helix_shards_", dir=shard_cache_dir)
     
     # Determine text extraction method
     def extract_text(example):
