@@ -41,6 +41,10 @@ jobs:
     - name: Smoke Test
       run: |
         python3 helix_lm/smoke_test.py
+    - name: Test eval graph equivalence
+      timeout-minutes: 90
+      run: |
+        python3 test_eval_compile.py
     - name: Test safe Iteration on Unknown Len Streaming
       timeout-minutes: 15
       run: |
@@ -57,8 +61,7 @@ jobs:
           test_pretrain_data.py \
           test_pretrain_data_court.py \
           test_experiment_tracking.py \
-          test_113m_param_train.py \
-          test_eval_compile.py \
+          test_113m_param_train.py
         python pretrain_data_court.py
     # Train a minimal model with PretrainTrainer
     - name: Demo run 
