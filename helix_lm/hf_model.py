@@ -358,7 +358,13 @@ class HelixForCausalLM(HelixPreTrainedModel, GenerationMixin):
         else:
             valid = attention_mask.to(device=e.device).bool()
         n = valid.sum(dim=1)
-        if B == 0 or int(n.max()) > T:
+        if B == 0:
+            return self.model.recurrent(e, e, attention_mask=attention_mask, cca_step=cca_step)
+        # n <= L always, so the length check needs the data only when L > T.
+        # For L <= T (every generation step inside the training context) this
+        # is a shape-only branch: no device->host sync, no torch.compile graph
+        # break. The data-dependent check is kept for the rare L > T case.
+        if L > T and int(n.max()) > T:
             return self.model.recurrent(e, e, attention_mask=attention_mask, cca_step=cca_step)
         # destination slot of each caller position; padded positions go to slot T (dropped)
         dest = torch.where(valid, valid.long().cumsum(dim=1) - 1, torch.full_like(n[:, None], T))

@@ -41,6 +41,10 @@ jobs:
     - name: Smoke Test
       run: |
         python3 helix_lm/smoke_test.py
+    - name: Test eval graph equivalence
+      timeout-minutes: 90
+      run: |
+        python3 test_eval_compile.py
     - name: Test safe Iteration on Unknown Len Streaming
       timeout-minutes: 15
       run: |
