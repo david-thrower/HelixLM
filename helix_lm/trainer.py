@@ -236,6 +236,10 @@ class Trainer:
         self._cleanup_shards = cleanup_shards
         self._train_texts_is_streaming = False
         self._val_texts_is_streaming = False
+        # Cleanup runs for every loader configuration, including injected loaders
+        # and validation-free SFT. Streaming branches overwrite these with paths.
+        self._train_shard_dir = None
+        self._val_shard_dir = None
 
         if example_prompts:
             self.example_prompts = example_prompts
