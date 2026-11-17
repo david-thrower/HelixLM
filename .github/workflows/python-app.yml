@@ -57,7 +57,8 @@ jobs:
           test_pretrain_data.py \
           test_pretrain_data_court.py \
           test_experiment_tracking.py \
-          test_113m_param_train.py
+          test_113m_param_train.py \
+          test_eval_compile.py \
         python pretrain_data_court.py
     # Train a minimal model with PretrainTrainer
     - name: Demo run 
