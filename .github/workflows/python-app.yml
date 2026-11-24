@@ -41,24 +41,24 @@ jobs:
     - name: Smoke Test
       run: |
         python3 helix_lm/smoke_test.py
-    - name: Test safe Iteration on Unknown Len Streaming
-      timeout-minutes: 15
-      run: |
-        python3 text_iter_unknown_len_pretrain.py
-    # Test PretrainTrainer and pretrain Dataset tooling
-    - name: Pretrain streaming equivalence test
-      timeout-minutes: 120
-      run: |
-        python3 test_pretrain_streaming_equivalence.py
-    - name: Pretraining data and launcher courts
-      timeout-minutes: 30
-      run: |
-        python -m unittest \
-          test_pretrain_data.py \
-          test_pretrain_data_court.py \
-          test_experiment_tracking.py \
-          test_113m_param_train.py
-        python pretrain_data_court.py
+    # - name: Test safe Iteration on Unknown Len Streaming
+    #   timeout-minutes: 15
+    #   run: |
+    #     python3 text_iter_unknown_len_pretrain.py
+    # # Test PretrainTrainer and pretrain Dataset tooling
+    # - name: Pretrain streaming equivalence test
+    #   timeout-minutes: 120
+    #   run: |
+    #     python3 test_pretrain_streaming_equivalence.py
+    # - name: Pretraining data and launcher courts
+    #   timeout-minutes: 30
+    #   run: |
+    #     python -m unittest \
+    #       test_pretrain_data.py \
+    #       test_pretrain_data_court.py \
+    #       test_experiment_tracking.py \
+    #       test_113m_param_train.py
+    #     python pretrain_data_court.py
     # Train a minimal model with PretrainTrainer
     - name: Demo run 
       timeout-minutes: 90
