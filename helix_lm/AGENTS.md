@@ -141,6 +141,8 @@ decoding, and evaluation remain possible explanations unless controls exclude th
 
 ## 3. Module boundaries and architecture lane
 
+The contents of helix_lm is sacred and should not be changed without explicit user agreement. Any artifact where this is changed needs to note the changes, as this would otherwise violate provenance of the source code -> artifact, leading me to "I don't know" being the answer when a member of the research community asks "How do I reproduce this | I ran this launcher against the most upstream source code and failed to reproduce, what did you do different?".
+
 | Concern | Canonical module |
 | --- | --- |
 | Model-wide configuration and presets | `helix_lm/config.py` |
