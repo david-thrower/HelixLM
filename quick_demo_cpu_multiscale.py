@@ -17,10 +17,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from helix_lm import HelixConfig, HelixForCausalLM, HelixTokenizer, PretrainTrainer
 
 
-EPOCHS = 10
+EPOCHS = 3
 MAX_SEQ_LEN = 96
-NUM_SAMPLES = 2600
-VAL_SPLIT = 0.2
+NUM_SAMPLES = 8666 # 2600
+VAL_SPLIT = 0.1
 
 EXAMPLE_PROMPTS = [
     "The next day, something unexpected",
