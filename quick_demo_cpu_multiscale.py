@@ -25,6 +25,9 @@ VAL_SPLIT = 0.1
 D_MODEL = 384
 N_HEADS = D_MODEL // 64
 CONNECTOR_DIM = D_MODEL // 2
+FFN_EXPANSION = 2.67
+N_COLUMNS = 3
+
 
 EXAMPLE_PROMPTS = [
     "The next day, something unexpected",
@@ -50,8 +53,10 @@ def main():
         tokenizer_name="gpt2",
         use_titans_memory=False,
         d_model=D_MODEL,
+        n_columns=N_COLUMNS,
         n_heads=N_HEADS,
         n_loops=3,
+        ffn_expansion=FFN_EXPANSION,
         attention_mode="multi_scale_windowed",
         local_window=32,
         coarse_window=48,
