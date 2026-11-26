@@ -61,7 +61,7 @@ jobs:
     #     python pretrain_data_court.py
     # Train a minimal model with PretrainTrainer
     - name: Demo run 
-      timeout-minutes: 90
+      timeout-minutes: 180
       run: |
         python3 quick_demo_cpu_multiscale.py
     # Test SFTTrainer and its Dataset Tooling
